@@ -1,0 +1,115 @@
+<resources>
+    <string name="app_name">VoltTrace</string>
+
+    <!-- Navigation -->
+    <string name="nav_live">Live</string>
+    <string name="nav_causes">Causes</string>
+    <string name="nav_timeline">Timeline</string>
+    <string name="nav_inspector">Inspector</string>
+
+    <!-- Time Windows -->
+    <string name="window_1h">1H</string>
+    <string name="window_6h">6H</string>
+    <string name="window_24h">24H</string>
+    <string name="window_7d">7D</string>
+    <string name="window_all">All</string>
+
+    <!-- Live Screen -->
+    <string name="live_title">Live Telemetry</string>
+    <string name="live_subtitle">Real-time hardware power oscilloscope</string>
+    <string name="status_discharging">DISCHARGING</string>
+    <string name="status_charging">CHARGING</string>
+    <string name="status_full">CHARGED</string>
+    <string name="metric_power">Power</string>
+    <string name="metric_current">Current</string>
+    <string name="metric_voltage">Voltage</string>
+    <string name="metric_temperature">Temp</string>
+    <string name="metric_radio">Radio</string>
+    <string name="metric_brightness">Display</string>
+    <string name="metric_thermal">Thermal</string>
+    <string name="metric_health">Health</string>
+    <string name="oscilloscope_title">Instantaneous Power Trace</string>
+    <string name="oscilloscope_subtitle">Live wattage draw (2s hardware poll)</string>
+    <string name="action_capture_snapshot">Log Snapshot</string>
+    <string name="action_start_probe">Run 30s Drain Probe</string>
+    <string name="action_stop_probe">Stop Probe</string>
+    <string name="probe_title">30-Second Live Drain Probe</string>
+    <string name="probe_desc">Measures real-time power draw, voltage sag, and thermal slope right now to isolate active drain behavior.</string>
+    <string name="snapshot_saved_msg">Telemetry snapshot logged to timeline</string>
+
+    <!-- Causes Screen -->
+    <string name="causes_title">True Root Causes</string>
+    <string name="causes_subtitle">Evidence-backed consumption attribution</string>
+    <string name="usage_access_banner_title">Unlock Per-App Root-Cause Attribution</string>
+    <string name="usage_access_banner_body">Grant Android Usage Access so VoltTrace can correlate exact app foreground sessions and background wakeups against measured wattage drops.</string>
+    <string name="action_grant_usage_access">Enable Usage Access</string>
+    <string name="section_drain_attribution">Drain Attribution Breakdown</string>
+    <string name="section_diagnosed_causes">Diagnosed Drivers</string>
+    <string name="section_app_culprits">App Drain Correlation</string>
+    <string name="empty_causes_title">Building Longitudinal Baseline</string>
+    <string name="empty_causes_body">VoltTrace samples real hardware telemetry automatically every 15 minutes and whenever you open the app. Let it run across active and standby periods to isolate deep-sleep and app drain drivers.</string>
+
+    <!-- Timeline Screen -->
+    <string name="timeline_title">Power Timeline</string>
+    <string name="timeline_subtitle">Longitudinal drain, voltage &amp; thermal history</string>
+    <string name="chart_mode_power">Power (W)</string>
+    <string name="chart_mode_temp">Temp (°C)</string>
+    <string name="chart_mode_voltage">Voltage (V)</string>
+    <string name="section_active_vs_standby">Active vs Standby Drain</string>
+    <string name="section_radio_efficiency">Radio Power Efficiency</string>
+    <string name="section_sample_log">Recorded Telemetry Log</string>
+    <string name="label_screen_on">Screen On</string>
+    <string name="label_screen_off">Standby (Off)</string>
+    <string name="label_wifi">Wi-Fi</string>
+    <string name="label_cellular">Cellular</string>
+
+    <!-- Inspector Screen -->
+    <string name="inspector_title">Cell Inspector</string>
+    <string name="inspector_subtitle">Hardware diagnostics &amp; monitoring engine</string>
+    <string name="section_cell_specs">Battery Hardware Profile</string>
+    <string name="section_monitoring_engine">Background Collector</string>
+    <string name="section_appearance">Appearance &amp; Calibration</string>
+    <string name="section_data_management">Telemetry Storage</string>
+    <string name="bg_monitor_title">15-Min Periodic Sampling</string>
+    <string name="bg_monitor_desc">Uses low-overhead WorkManager to record battery %, current, voltage, temperature, radio, and app activity over time.</string>
+    <string name="usage_access_status_title">App Usage Access</string>
+    <string name="usage_access_granted">Granted — Per-app correlation active</string>
+    <string name="usage_access_denied">Not granted — Tap to open Android settings</string>
+    <string name="action_clear_history">Reset Telemetry History</string>
+    <string name="dialog_clear_title">Clear Recorded Telemetry?</string>
+    <string name="dialog_clear_body">This removes all locally stored battery samples and app correlation history. Live monitoring will immediately start a fresh baseline.</string>
+    <string name="action_cancel">Cancel</string>
+    <string name="action_confirm_clear">Clear Data</string>
+
+    <!-- Content Descriptions -->
+    <string name="cd_battery_gauge">Live battery level and instantaneous wattage gauge</string>
+    <string name="cd_oscilloscope">Live power waveform chart</string>
+    <string name="cd_timeline_chart">Historical battery percentage and telemetry chart</string>
+    <string name="cd_open_settings">Open Android system settings</string>
+    <string name="cd_capture_snapshot">Record battery telemetry snapshot now</string>
+
+    <!-- v2 Precision Monitor, Forensics, Alerts & Widget -->
+    <string name="precision_monitor_title">High-Precision 1-Min Monitor</string>
+    <string name="precision_monitor_desc">Runs an opt-in foreground service sampling battery and hardware rails every 60 seconds for lab-grade precision.</string>
+    <string name="precision_badge_active">1-MIN PRECISION</string>
+    <string name="critical_alerts_title">Critical Drain &amp; Thermal Alerts</string>
+    <string name="critical_alerts_desc">Notifies only on critical battery overheating or abnormal screen-off standby wakelock drain (60-min cooldown).</string>
+    <string name="action_export_report">Export Report</string>
+    <string name="export_sheet_title">Share Diagnostic Report</string>
+    <string name="export_sheet_subtitle">Zero-permission export via Android Share Sheet for the active time window.</string>
+    <string name="export_summary_title">Forensic Summary (.md)</string>
+    <string name="export_summary_desc">Executive verdict, hardware attribution breakdown, sleep-session audit, and top culprits.</string>
+    <string name="export_csv_title">Raw Telemetry Table (.csv)</string>
+    <string name="export_csv_desc">Full timestamped electrical, thermal, display, radio, and app dataset for spreadsheet analysis.</string>
+    <string name="section_sleep_sessions">Sleep &amp; Standby Forensics</string>
+    <string name="empty_sleep_sessions">No pure screen-off sessions of 5+ minutes recorded in this window yet. Leave the screen off to audit kernel deep-sleep Doze health.</string>
+    <string name="widget_name">VoltTrace Live Monitor</string>
+    <string name="widget_description">Displays real-time battery level, wattage draw, temperature, and top root-cause drain driver.</string>
+    <string name="widget_refresh_label">SYNC</string>
+    <string name="widget_loading_cause">Analyzing hardware rails…</string>
+    <string name="cd_widget_refresh">Refresh live battery telemetry widget</string>
+    <string name="cd_export_report">Export battery diagnostic report</string>
+    <string name="action_drill_down">Drill Down</string>
+    <string name="cd_drill_down_sample">Inspect root cause and apps active around this timestamp</string>
+    <string name="section_detected_spikes">Detected Drain Spikes — Tap to Inspect</string>
+</resources>

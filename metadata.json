@@ -1,0 +1,6 @@
+{
+  "name": "VoltTrace",
+  "description": "Deep battery telemetry and root-cause analyzer that tracks power over time to uncover true causes of battery drain.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

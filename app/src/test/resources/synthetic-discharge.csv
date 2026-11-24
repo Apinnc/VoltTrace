@@ -1,0 +1,8 @@
+timestamp_utc,level_pct,voltage_mv,temp_c,current_signed_ma,charge_counter_uah,elapsed_realtime_ms,uptime_ms,is_charging,screen_on,network_transport,foreground_app,source
+2000-01-01T00:00:00Z,80,4000,25,-200,4000000,0,0,false,false,OFFLINE,,TEST
+2000-01-01T00:15:00Z,79,4000,26,-200,3950000,0,0,false,false,OFFLINE,,TEST
+2000-01-01T00:30:00Z,78,4000,27,-200,3900000,3600000,1800000,false,false,OFFLINE,,TEST
+2000-01-01T00:45:00Z,77,4000,28,-1500,3850000,4500000,2100000,false,true,WIFI,org.example.demo,TEST
+2000-01-01T01:00:00Z,76,4000,32,-200,3800000,5400000,2400000,false,true,WIFI,org.example.demo,TEST
+2000-01-01T01:15:00Z,75,4000,27,-200,3750000,6300000,2700000,false,false,OFFLINE,,TEST
+2000-01-01T01:30:00Z,74,4000,25,-200,3700000,7200000,3000000,false,false,OFFLINE,,TEST
