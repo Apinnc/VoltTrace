@@ -25,3 +25,9 @@ build/
 .build-outputs/
 .aistudio/
 public/assets/aistudio/
+
+# VoltTrace report exports and screenshots
+VoltTrace_Battery_Forensic_Report*
+Screenshot_*_VoltTrace*
+volttrace_*_[0-9]*.csv
+volttrace_*_[0-9]*.md
