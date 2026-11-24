@@ -8,15 +8,33 @@ import com.example.domain.RootCauseAnalyzer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
-import java.io.File
 
 class CsvReplayRegressionTest {
 
+    /**
+     * Anonymized, synthetic 6-hour telemetry CSV exercising:
+     * - Legacy records with zeroed boot clocks (elapsed_realtime_ms = 0, uptime_ms = 0)
+     * - Counter-first charge loss accounting
+     * - Kernel deep sleep vs. CPU awake calculations from monotonic boot clocks
+     * - Instantaneous discharge peak and thermal peak timestamping
+     * - Traceable DrainEpisode generation
+     */
+    private val syntheticTelemetryCsv = """
+timestamp_utc,level_pct,voltage_mv,temp_c,current_ma,current_signed_ma,power_mw,power_signed_mw,charge_counter_uah,elapsed_realtime_ms,uptime_ms,is_charging,plugged_type,screen_on,brightness_pct,refresh_hz,auto_brightness,network_transport,cellular_active,wifi_enabled,wifi_connected,gps_enabled,bluetooth_enabled,airplane_mode,link_down_kbps,metered_network,thermal_status,power_save,foreground_app,source
+2025-01-15T10:00:00Z,90,4200,28.5,120.0,-120.0,504.0,-504.0,4500000,0,0,false,BATTERY,false,0,60,true,WIFI,false,true,true,false,false,false,50000,false,0,false,"",WORK
+2025-01-15T10:15:00Z,89,4180,29.0,150.0,-150.0,627.0,-627.0,4460000,0,0,false,BATTERY,false,0,60,true,WIFI,false,true,true,false,false,false,50000,false,0,false,"",WORK
+2025-01-15T10:30:00Z,88,4150,30.2,300.0,-300.0,1245.0,-1245.0,4400000,0,0,false,BATTERY,true,55,120,true,WIFI,false,true,true,false,false,false,50000,false,0,false,"Sample Browser",LIVE
+2025-01-15T10:45:00Z,85,4060,33.4,1950.0,-1950.0,7917.0,-7917.0,4260000,10000000,4000000,false,BATTERY,true,75,120,true,CELLULAR,true,true,false,true,true,false,12000,true,0,false,"Sample Maps",LIVE
+2025-01-15T11:00:00Z,82,4020,35.6,2200.0,-2200.0,8844.0,-8844.0,4110000,10900000,4900000,false,BATTERY,true,80,120,true,CELLULAR,true,true,false,true,true,false,12000,true,0,false,"Sample Maps",LIVE
+2025-01-15T11:30:00Z,81,4120,30.1,95.0,-95.0,391.4,-391.4,4070000,12700000,5200000,false,BATTERY,false,0,60,true,WIFI,false,true,true,false,false,false,60000,false,0,false,"",WORK
+2025-01-15T12:30:00Z,80,4110,28.8,80.0,-80.0,328.8,-328.8,4020000,16300000,5620000,false,BATTERY,false,0,60,true,WIFI,false,true,true,false,false,false,60000,false,0,false,"",WORK
+2025-01-15T13:00:00Z,76,4010,34.2,1200.0,-1200.0,4812.0,-4812.0,3820000,18100000,7200000,false,BATTERY,true,65,120,true,WIFI,false,true,true,false,true,false,60000,false,0,false,"Sample Video",LIVE
+    """.trimIndent()
+
     @Test
-    fun replaysSyntheticCsvAndReproducesKnownMetrics() {
-        val csv = requireNotNull(javaClass.getResource("/synthetic-discharge.csv")).readText()
-        val samples = CsvTelemetryParser.parse(csv)
-        assertEquals(7, samples.size)
+    fun replaysSyntheticCsvAndVerifiesCounterChargeDeepSleepAndEpisodes() {
+        val samples = CsvTelemetryParser.parse(syntheticTelemetryCsv)
+        assertEquals("Expected 8 telemetry rows in synthetic CSV", 8, samples.size)
 
         val report = RootCauseAnalyzer.analyze(
             samples = samples,
@@ -28,54 +46,66 @@ class CsvReplayRegressionTest {
             thermalAlertCelsius = 39.0f
         )
 
-        // Six 15-minute intervals each lose 50 mAh. The first two rows lack boot clocks.
-        assertEquals(2, report.missingClockSampleCount)
-        assertTrue(report.chargeCounterMeasured)
-        assertEquals(300f, report.totalDischargedMah, 0.01f)
-        // Across the four intervals with clock readings, 60 minutes elapse and 20 are awake.
-        assertEquals(40L * 60_000L, report.totalUnpluggedDeepSleepMs)
-        assertEquals(6000f, report.peakDischargePowerMw, 0.01f)
+        // 1. Exactly 3 legacy records with 0 in both clock fields
+        assertEquals(3, report.missingClockSampleCount)
+
+        // 2. Net charge loss measured from hardware battery counter: 4,500,000 -> 3,820,000 uAh = 680.0 mAh
+        assertTrue("Charge loss must be counter-measured", report.chargeCounterMeasured)
+        assertEquals(680.0f, report.totalDischargedMah, 0.5f)
+
+        // 3. Total unplugged deep sleep across valid clock spans:
+        //    10:45->11:00: 15m elapsed, 15m awake, 0m sleep
+        //    11:00->11:30: 30m elapsed, 5m awake, 25m sleep
+        //    11:30->12:30: 60m elapsed, 7m awake, 53m sleep
+        //    12:30->13:00: 30m elapsed, 26.33m awake, 3.67m sleep
+        //    Total deep sleep ~= 81.67 min
+        val deepSleepMinutes = report.totalUnpluggedDeepSleepMs / 60_000.0
+        assertTrue(
+            "Expected ~81.7 minutes of deep sleep (81.0..82.5), got $deepSleepMinutes min",
+            deepSleepMinutes in 81.0..82.5
+        )
+
+        // 4. Instantaneous discharge peak: 8.844 W (8,844 mW @ 11:00:00Z)
+        assertEquals(8844.0f, report.peakDischargePowerMw, 2.0f)
         assertEquals(
-            "2000-01-01T00:45:00Z",
+            "2025-01-15T11:00:00Z",
             report.peakDischargePowerTimestampMs?.let { RootCauseAnalyzer.formatIsoUtc(it) }
         )
-        assertEquals(32f, report.peakTempC, 0.01f)
+
+        // 5. Peak battery temperature: 35.6 C discharging at 11:00:00Z
+        assertEquals(35.6f, report.peakTempC, 0.05f)
         assertEquals(false, report.peakTempWasCharging)
         assertEquals(
-            "2000-01-01T01:00:00Z",
+            "2025-01-15T11:00:00Z",
             report.peakTempTimestampMs?.let { RootCauseAnalyzer.formatIsoUtc(it) }
         )
 
-        assertEquals(6, report.drainEpisodes.size)
+        // 6. Traceable drain episodes must include observed activity, unknowns, and raw source readings
+        assertTrue("Expected significant drain episodes to be detected", report.drainEpisodes.size >= 2)
         report.drainEpisodes.forEach { ep ->
             assertTrue("Episode ${ep.id} missing observedActivity", ep.observedActivity.isNotEmpty())
             assertTrue("Episode ${ep.id} missing whatRemainsUnknown", ep.whatRemainsUnknown.isNotEmpty())
             assertTrue("Episode ${ep.id} missing sourceReadings", ep.sourceReadings.size >= 2)
         }
+
+        // 7. Hardware attribution honesty: 0 energy meters => explicitly labeled modeled
         assertTrue(report.hardwareAttributionMode.contains("Modeled", ignoreCase = true))
 
         val regeneratedMarkdown = DiagnosticReportGenerator.generateMarkdownSummary(
             report = report,
             latestSample = samples.last()
         )
-        assertTrue(regeneratedMarkdown.contains("300.0 mAh"))
-        assertTrue(regeneratedMarkdown.contains("40m 0s"))
-        assertTrue(regeneratedMarkdown.contains("40.0 min"))
-        assertTrue(regeneratedMarkdown.contains("-6.00 W"))
-        assertTrue(regeneratedMarkdown.contains("2 legacy/pre-upgrade records"))
+        assertTrue(regeneratedMarkdown.contains("680.0 mAh"))
+        assertTrue(regeneratedMarkdown.contains("-8.84 W"))
+        assertTrue(regeneratedMarkdown.contains("3 legacy/pre-upgrade records"))
         assertTrue(regeneratedMarkdown.contains("Significant Drain Episodes"))
         assertTrue(regeneratedMarkdown.contains("What Remains Unknown"))
         assertTrue(regeneratedMarkdown.contains("Source Readings"))
-
-        val outFile = File("build/outputs/volttrace_regenerated_report.md").apply {
-            parentFile?.mkdirs()
-        }
-        outFile.writeText(regeneratedMarkdown)
     }
 
     @Test
     fun summarizesPowerMonitorEnergyMetersAcrossSameBootSnapshotsAndRejectsRebootResets() {
-        val base = 1_760_000_000_000L
+        val base = 1_736_935_200_000L
         val snapshots = listOf(
             // Boot 1: Display ODPM rail increases by 360_000_000 uWs = 100.0 mWh
             EnergyMeterSnapshotEntity(

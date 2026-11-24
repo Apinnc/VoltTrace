@@ -112,4 +112,11 @@
     <string name="action_drill_down">Drill Down</string>
     <string name="cd_drill_down_sample">Inspect root cause and apps active around this timestamp</string>
     <string name="section_detected_spikes">Detected Drain Spikes — Tap to Inspect</string>
+    <string name="overnight_morning_report_badge">Morning Report</string>
+    <string name="overnight_before_plugged_in_badge">Before you plugged in</string>
+    <string name="overnight_awaiting_badge">Morning Report · Calibrating</string>
+    <string name="action_replay_night">Replay Night</string>
+    <string name="action_replay_window">Replay Window</string>
+    <string name="action_watch_again">Watch for this again</string>
+    <string name="action_watching_active">Watching ✓</string>
 </resources>

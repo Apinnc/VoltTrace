@@ -39,9 +39,12 @@ import com.example.R
 import com.example.data.local.BatterySampleEntity
 import com.example.domain.BatteryAnalysisReport
 import com.example.domain.HardwareSubsystemStatus
+import com.example.domain.OvernightReplayReport
 import com.example.domain.SettingsAction
+import com.example.domain.WatchInvestigationConfig
 import com.example.ui.components.LiveHardwareSubsystemsCard
 import com.example.ui.components.LiveOscilloscopeCard
+import com.example.ui.components.OvernightMorningReportCard
 import com.example.ui.components.PowerGaugeCard
 import com.example.ui.components.RootCauseCard
 import com.example.ui.theme.LocalTelemetryColors
@@ -55,9 +58,13 @@ fun LiveScreen(
     liveSubsystems: List<HardwareSubsystemStatus>,
     oscilloscopeMw: List<Float>,
     report: BatteryAnalysisReport,
+    overnightReport: OvernightReplayReport,
+    watchConfig: WatchInvestigationConfig,
     probeState: ProbeUiState,
     totalSampleCount: Int,
     highPrecisionEnabled: Boolean,
+    onOpenOvernightReplay: () -> Unit,
+    onToggleWatch: () -> Unit,
     onToggleHighPrecision: (Boolean) -> Unit,
     onCaptureSnapshot: () -> Unit,
     onToggleProbe: () -> Unit,
@@ -109,6 +116,16 @@ fun LiveScreen(
                     )
                 }
             }
+        }
+
+        // Morning Report + Personal Baseline + One-Tap Replay + "Before you plugged in" fallback
+        item {
+            OvernightMorningReportCard(
+                report = overnightReport,
+                watchConfig = watchConfig,
+                onOpenReplay = onOpenOvernightReplay,
+                onToggleWatch = onToggleWatch
+            )
         }
 
         // Signature Radial Battery & Power Gauge

@@ -29,6 +29,7 @@ object BatteryAlertManager {
     const val NOTIFICATION_ID_FOREGROUND = 1001
     private const val NOTIFICATION_ID_THERMAL = 2001
     private const val NOTIFICATION_ID_STANDBY = 2002
+    private const val NOTIFICATION_ID_WATCH_MATCH = 2003
 
     private const val ALERT_COOLDOWN_MS = 60L * 60L * 1000L // 60 minutes anti-spam cooldown
 
@@ -181,17 +182,40 @@ object BatteryAlertManager {
         }
     }
 
+    suspend fun notifyWatchMatchIfNeeded(
+        context: Context,
+        title: String,
+        reason: String,
+        matchedAtMs: Long,
+        settings: UserMonitorSettings,
+        preferences: MonitorPreferences
+    ) {
+        if (!settings.watchConfig.active) return
+        if (matchedAtMs <= settings.watchConfig.lastMatchedAtMs) return
+        preferences.recordWatchMatch(matchedAtMs, reason)
+        if (!settings.criticalAlertsEnabled || !hasNotificationPermission(context)) return
+        ensureChannels(context)
+        postCriticalNotification(
+            context = context,
+            notificationId = NOTIFICATION_ID_WATCH_MATCH,
+            title = "Watch Matched: ${title.ifBlank { "Overnight Drain Pattern" }}",
+            body = "$reason. Open VoltTrace to replay the window.",
+            targetRoute = "live"
+        )
+    }
+
     private fun postCriticalNotification(
         context: Context,
         notificationId: Int,
         title: String,
-        body: String
+        body: String,
+        targetRoute: String = "causes"
     ) {
         if (!hasNotificationPermission(context)) return
 
         val intent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            putExtra(MainActivity.EXTRA_START_ROUTE, "causes")
+            putExtra(MainActivity.EXTRA_START_ROUTE, targetRoute)
         }
         val pendingIntent = PendingIntent.getActivity(
             context,

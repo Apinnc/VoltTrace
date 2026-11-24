@@ -14,10 +14,13 @@ import com.example.domain.AnalysisWindow
 import com.example.domain.BatteryAnalysisReport
 import com.example.domain.ExportFormat
 import com.example.domain.HardwareSubsystemStatus
+import com.example.domain.OvernightReplayEngine
+import com.example.domain.OvernightReplayReport
 import com.example.domain.ProbeSessionResult
 import com.example.domain.RootCauseAnalyzer
 import com.example.domain.SpikeForensicReport
 import com.example.domain.SpikeInspector
+import com.example.domain.WatchInvestigationConfig
 import com.example.ui.theme.ThemeMode
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -80,6 +83,9 @@ class VoltTraceViewModel(
 
     private val _isInvestigatingSpike = MutableStateFlow(false)
     val isInvestigatingSpike: StateFlow<Boolean> = _isInvestigatingSpike.asStateFlow()
+
+    private val _showOvernightReplaySheet = MutableStateFlow(false)
+    val showOvernightReplaySheet: StateFlow<Boolean> = _showOvernightReplaySheet.asStateFlow()
 
     private var probeJob: Job? = null
     private var spikeJob: Job? = null
@@ -158,6 +164,48 @@ class VoltTraceViewModel(
             ratedCapacityMah = 4500,
             thermalAlertCelsius = 39f
         )
+    )
+
+    private val baselineSamples: StateFlow<List<BatterySampleEntity>> = repository
+        .observeSamplesSince(System.currentTimeMillis() - 14L * 24L * 60L * 60L * 1000L)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    private val recentOvernightAppEvents = repository
+        .observeAppEventsSince(System.currentTimeMillis() - 48L * 60L * 60L * 1000L)
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000),
+            initialValue = emptyList()
+        )
+
+    val overnightReport: StateFlow<OvernightReplayReport> = combine(
+        baselineSamples,
+        recentOvernightAppEvents,
+        settings
+    ) { allSamples, appEvents, userSettings ->
+        val report = OvernightReplayEngine.analyze(
+            allSamples = allSamples,
+            appEvents = appEvents,
+            watchConfig = userSettings.watchConfig,
+            ratedCapacityMah = userSettings.ratedCapacityMah
+        )
+        if (report.watchTriggeredThisWindow &&
+            report.windowEndMs > userSettings.watchConfig.lastMatchedAtMs &&
+            !report.watchMatchReason.isNullOrBlank()
+        ) {
+            viewModelScope.launch {
+                repository.recordWatchMatch(report.windowEndMs, report.watchMatchReason)
+            }
+        }
+        report
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = OvernightReplayEngine.analyze(emptyList())
     )
 
     init {
@@ -275,6 +323,90 @@ class VoltTraceViewModel(
         spikeJob?.cancel()
         _isInvestigatingSpike.value = false
         _selectedSpikeReport.value = null
+    }
+
+    fun openOvernightReplay() {
+        if (overnightReport.value.samples.isNotEmpty()) {
+            _showOvernightReplaySheet.value = true
+        }
+    }
+
+    fun dismissOvernightReplay() {
+        _showOvernightReplaySheet.value = false
+    }
+
+    fun toggleWatchForThisAgain() {
+        val currentWatch = settings.value.watchConfig
+        val report = overnightReport.value
+        viewModelScope.launch {
+            if (currentWatch.active) {
+                repository.clearWatchInvestigation()
+                _snackbarMessage.value = "Watch investigation cleared"
+            } else {
+                val config = WatchInvestigationConfig(
+                    active = true,
+                    title = report.suggestedWatchTitle,
+                    suspectLabel = report.suggestedWatchSuspect,
+                    suspectPackage = report.suggestedWatchPackage,
+                    triggerDrainPctPerHour = report.suggestedTriggerRatePctHr,
+                    triggerPeakMw = report.suggestedTriggerPeakMw,
+                    armedAtMs = System.currentTimeMillis(),
+                    matchCount = 0,
+                    lastMatchedAtMs = 0L,
+                    lastMatchSummary = ""
+                )
+                repository.armWatchInvestigation(config)
+                _snackbarMessage.value = "Armed: ${config.title}"
+            }
+        }
+    }
+
+    fun inspectOvernightSample(sample: BatterySampleEntity) {
+        val samples = overnightReport.value.samples
+        val idx = samples.indexOfFirst { it.id == sample.id && it.timestampMs == sample.timestampMs }
+            .takeIf { it >= 0 } ?: return
+        _showOvernightReplaySheet.value = false
+        val target = samples[idx]
+        val prev = samples.getOrNull(idx - 1)
+        val next = samples.getOrNull(idx + 1)
+
+        val queryStartMs = (prev?.timestampMs ?: (target.timestampMs - 10L * 60_000L))
+            .coerceAtLeast(target.timestampMs - 20L * 60_000L)
+            .coerceAtMost(target.timestampMs - 5L * 60_000L)
+        val queryEndMs = (next?.timestampMs ?: (target.timestampMs + 5L * 60_000L))
+            .coerceAtMost(target.timestampMs + 10L * 60_000L)
+            .coerceAtLeast(target.timestampMs + 3L * 60_000L)
+
+        spikeJob?.cancel()
+        spikeJob = viewModelScope.launch {
+            _isInvestigatingSpike.value = true
+            val usageGranted = repository.hasUsageStatsPermission()
+            _hasUsageAccess.value = usageGranted
+            val events = if (usageGranted) {
+                runCatching { repository.queryDetailedEventsAround(queryStartMs, queryEndMs) }
+                    .getOrDefault(emptyList())
+            } else {
+                emptyList()
+            }
+            val apps = if (usageGranted) {
+                runCatching { repository.queryAppUsageRange(queryStartMs, queryEndMs) }
+                    .getOrDefault(emptyList())
+            } else {
+                emptyList()
+            }
+
+            _selectedSpikeReport.value = SpikeInspector.analyzeSpike(
+                samples = samples,
+                targetIndex = idx,
+                usageEvents = events,
+                appUsage = apps,
+                appDrainEvents = recentOvernightAppEvents.value,
+                energyMeters = windowEnergyMeters.value,
+                hasUsageAccess = usageGranted,
+                ratedCapacityMah = settings.value.ratedCapacityMah
+            )
+            _isInvestigatingSpike.value = false
+        }
     }
 
     fun scanEnergyMeters(showToast: Boolean = true) {

@@ -15,18 +15,13 @@
 .cxx
 local.properties
 .env
-debug.keystore
-
-# Local credentials, signing keys and service configuration
 .env.*
 !.env.example
-*.jks
+debug.keystore
 *.keystore
+*.jks
 google-services.json
-
-# Phone captures and reports imported through AI Studio
-/public/assets/aistudio/
-VoltTrace_Battery_Forensic_Report*
-Screenshot_*_VoltTrace*
-volttrace_*_[0-9]*.csv
-volttrace_*_[0-9]*.md
+build/
+.build-outputs/
+.aistudio/
+public/assets/aistudio/

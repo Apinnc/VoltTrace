@@ -161,4 +161,16 @@ class BatteryRepository(
     suspend fun setRatedCapacityMah(capacityMah: Int) {
         preferences.setRatedCapacityMah(capacityMah)
     }
+
+    suspend fun armWatchInvestigation(config: com.example.domain.WatchInvestigationConfig) {
+        preferences.armWatchInvestigation(config)
+    }
+
+    suspend fun clearWatchInvestigation() {
+        preferences.clearWatchInvestigation()
+    }
+
+    suspend fun recordWatchMatch(matchedAtMs: Long, summary: String) {
+        preferences.recordWatchMatch(matchedAtMs, summary)
+    }
 }

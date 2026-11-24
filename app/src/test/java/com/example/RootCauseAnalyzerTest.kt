@@ -138,7 +138,7 @@ class RootCauseAnalyzerTest {
     @Test
     fun normalizesSamsungMilliampUnitsAndSignedPowerDirection() {
         val base = 1_700_000_000_000L
-        // Samsung Galaxy S24 Ultra raw HAL value: 4300 mA fast charging stored as 4300L
+        // Legacy OEM HAL value: 4300 mA fast charging stored as 4300L
         val fastChargeSample = sample(
             timestampMs = base,
             levelPct = 80,
@@ -308,7 +308,7 @@ class RootCauseAnalyzerTest {
             corruptedTrickleRow.powerWatts < 0.2f
         )
 
-        // Fresh µA reading from S24 Ultra trickle charge: 14,784 µA = 14.784 mA (~0.065 W)
+        // Fresh µA reading during trickle charge: 14,784 µA = 14.784 mA (~0.065 W)
         val cleanMicroAmpRow = sample(
             timestampMs = base + 60_000L,
             levelPct = 98,
@@ -414,8 +414,8 @@ class RootCauseAnalyzerTest {
 
         val bgEvent = com.example.domain.WindowUsageEventItem(
             timestampMs = base + 19 * 60_000L,
-            packageName = "com.hualai",
-            appLabel = "Wyze",
+            packageName = "com.example.syncservice",
+            appLabel = "Sample Sync App",
             eventLabel = "Foreground Service Started",
             isBackgroundService = true
         )
@@ -435,7 +435,7 @@ class RootCauseAnalyzerTest {
         assertEquals(55f, drillDown.chargeLostBeforeMah ?: 0f, 0.5f)
         assertTrue(drillDown.counterMeasured)
         assertEquals(90f, drillDown.awakePctBefore ?: 0f, 1.0f)
-        assertTrue(drillDown.likelyDrivers.any { it.contains("Wyze") })
+        assertTrue(drillDown.likelyDrivers.any { it.contains("Sample Sync App") })
         assertTrue(drillDown.likelyDrivers.any { it.contains("90%") })
         assertTrue(drillDown.stateChanges.any { it.contains("-80 mV") })
         assertTrue(drillDown.whatRemainsUnknown.isNotEmpty())

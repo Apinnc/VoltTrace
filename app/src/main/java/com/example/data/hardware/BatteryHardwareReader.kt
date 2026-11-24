@@ -199,8 +199,8 @@ class BatteryHardwareReader(private val context: Context) {
      * Normalizes OEM current reporting to canonical signed microamperes (µA):
      * positive (+) when charging, negative (-) when discharging.
      *
-     * Auto-detects whether the device HAL reports µA (standard AOSP & modern Samsung Galaxy
-     * S24 Ultra) vs raw mA (older Samsung HALs) by inspecting both CURRENT_NOW and
+     * Auto-detects whether the device HAL reports µA (standard AOSP & modern OEM HALs)
+     * vs raw mA (legacy OEM HALs) by inspecting both CURRENT_NOW and
      * CURRENT_AVERAGE. Any reading >= 10,000 proves µA units (since no single-cell phone
      * battery draws >= 10 A continuously) and permanently prevents sub-25 mA trickle currents
      * (e.g. 14,784 µA at 98% charge) from being mis-scaled 1000x into phantom 65 W spikes.

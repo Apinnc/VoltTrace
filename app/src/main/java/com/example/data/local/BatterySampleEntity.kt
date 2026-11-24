@@ -51,7 +51,7 @@ data class BatterySampleEntity(
     /**
      * Normalized current magnitude in milliamperes (mA).
      *
-     * Standard Android HALs (including Galaxy S24 Ultra) report microamperes (µA),
+     * Standard Android HALs (including modern flagship OEM HALs) report microamperes (µA),
      * while some older OEM HALs report milliamperes directly (1..9,500 mA).
      * Also heals legacy DB rows where sub-25 mA µA trickle readings (e.g. 14,784 µA)
      * were previously over-multiplied by 1000 (>10.5 A is physically impossible on a

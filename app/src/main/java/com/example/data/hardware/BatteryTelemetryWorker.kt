@@ -7,6 +7,7 @@ import com.example.data.local.AppDrainEventEntity
 import com.example.data.local.MonitorPreferences
 import com.example.data.local.VoltTraceDatabase
 import com.example.domain.AnalysisWindow
+import com.example.domain.OvernightReplayEngine
 import com.example.domain.RootCauseAnalyzer
 import com.example.widget.VoltTraceWidgetUpdater
 import kotlinx.coroutines.flow.first
@@ -101,6 +102,28 @@ class BatteryTelemetryWorker(
                 settings = settings,
                 preferences = prefs
             )
+
+            // Evaluate armed "Watch for this again" investigation in the background
+            if (settings.watchConfig.active) {
+                val recentAppEvents = dao.observeAppEventsSince(since24h).first()
+                val overnight = OvernightReplayEngine.analyze(
+                    allSamples = recentSamples,
+                    appEvents = recentAppEvents,
+                    watchConfig = settings.watchConfig,
+                    ratedCapacityMah = settings.ratedCapacityMah,
+                    nowMs = current.timestampMs
+                )
+                if (overnight.watchTriggeredThisWindow && !overnight.watchMatchReason.isNullOrBlank()) {
+                    BatteryAlertManager.notifyWatchMatchIfNeeded(
+                        context = applicationContext,
+                        title = settings.watchConfig.title,
+                        reason = overnight.watchMatchReason,
+                        matchedAtMs = overnight.windowEndMs,
+                        settings = settings,
+                        preferences = prefs
+                    )
+                }
+            }
 
             // Refresh home screen widgets with the latest telemetry & top driver
             VoltTraceWidgetUpdater.updateAllWidgets(applicationContext)

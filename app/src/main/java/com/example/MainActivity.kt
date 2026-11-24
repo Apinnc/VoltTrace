@@ -61,6 +61,8 @@ import androidx.navigation.compose.rememberNavController
 import com.example.data.hardware.BatteryAlertManager
 import com.example.domain.ExportFormat
 import com.example.ui.components.ExportReportBottomSheet
+import com.example.ui.components.OvernightReplayBottomSheet
+import com.example.ui.components.SpikeDrillDownBottomSheet
 import com.example.ui.components.SystemSettingsIntents
 import com.example.ui.screens.CausesScreen
 import com.example.ui.screens.InspectorScreen
@@ -136,6 +138,8 @@ private fun VoltTraceRoot(
     val energyMeterInventory by viewModel.energyMeterInventory.collectAsStateWithLifecycle()
     val selectedSpikeReport by viewModel.selectedSpikeReport.collectAsStateWithLifecycle()
     val isInvestigatingSpike by viewModel.isInvestigatingSpike.collectAsStateWithLifecycle()
+    val overnightReport by viewModel.overnightReport.collectAsStateWithLifecycle()
+    val showOvernightReplaySheet by viewModel.showOvernightReplaySheet.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
     val navController = rememberNavController()
@@ -238,6 +242,27 @@ private fun VoltTraceRoot(
             )
         }
 
+        if (showOvernightReplaySheet) {
+            OvernightReplayBottomSheet(
+                report = overnightReport,
+                watchConfig = settings.watchConfig,
+                onDismiss = viewModel::dismissOvernightReplay,
+                onToggleWatch = viewModel::toggleWatchForThisAgain,
+                onInspectSample = viewModel::inspectOvernightSample
+            )
+        }
+
+        selectedSpikeReport?.let { spike ->
+            SpikeDrillDownBottomSheet(
+                report = spike,
+                hasUsageAccess = hasUsageAccess,
+                onDismiss = viewModel::dismissSpikeInspection,
+                onOpenSettings = { action, pkg ->
+                    SystemSettingsIntents.launch(context, action, pkg)
+                }
+            )
+        }
+
         BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
             val useRail = maxWidth >= 600.dp
 
@@ -323,9 +348,13 @@ private fun VoltTraceRoot(
                                     liveSubsystems = liveSubsystems,
                                     oscilloscopeMw = oscilloscopeMw,
                                     report = report,
+                                    overnightReport = overnightReport,
+                                    watchConfig = settings.watchConfig,
                                     probeState = probeState,
                                     totalSampleCount = totalSampleCount,
                                     highPrecisionEnabled = settings.highPrecisionMonitorEnabled,
+                                    onOpenOvernightReplay = viewModel::openOvernightReplay,
+                                    onToggleWatch = viewModel::toggleWatchForThisAgain,
                                     onToggleHighPrecision = handlePrecisionToggle,
                                     onCaptureSnapshot = viewModel::captureManualSnapshot,
                                     onToggleProbe = viewModel::toggleDrainProbe,
@@ -353,7 +382,7 @@ private fun VoltTraceRoot(
                                     report = report,
                                     selectedWindow = selectedWindow,
                                     hasUsageAccess = hasUsageAccess,
-                                    selectedSpikeReport = selectedSpikeReport,
+                                    selectedSpikeReport = null,
                                     isInvestigatingSpike = isInvestigatingSpike,
                                     onSelectWindow = viewModel::selectWindow,
                                     onInspectSample = viewModel::inspectTimelineSample,
