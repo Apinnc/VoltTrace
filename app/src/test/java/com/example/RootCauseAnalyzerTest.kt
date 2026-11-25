@@ -136,31 +136,40 @@ class RootCauseAnalyzerTest {
     }
 
     @Test
-    fun normalizesSamsungMilliampUnitsAndSignedPowerDirection() {
+    fun preservesCanonicalMicroAmpsAndHandlesLegacyMilliampHalSeparately() {
         val base = 1_700_000_000_000L
-        // Legacy OEM HAL value: 4300 mA fast charging stored as 4300L
+        // Canonical Android µA values stored in Room: +4,300,000 µA fast charging
         val fastChargeSample = sample(
             timestampMs = base,
             levelPct = 80,
             voltageMv = 4375,
-            currentMicroA = 4_300L,
+            currentMicroA = 4_300_000L,
             isCharging = true
         )
         assertEquals(4300f, fastChargeSample.currentAbsMa, 0.1f)
         assertEquals(4300f, fastChargeSample.currentSignedMa, 0.1f)
         assertTrue("Expected ~18.8 W charging power, got ${fastChargeSample.powerSignedWatts}", fastChargeSample.powerSignedWatts in 18.5f..19.1f)
 
-        // Samsung discharging value: -2900 mA stored as -2900L
+        // Canonical Android µA discharging value: -2,900,000 µA
         val heavyDischargeSample = sample(
             timestampMs = base + 60_000L,
             levelPct = 79,
             voltageMv = 4030,
-            currentMicroA = -2_900L,
+            currentMicroA = -2_900_000L,
             isCharging = false
         )
         assertEquals(2900f, heavyDischargeSample.currentAbsMa, 0.1f)
         assertEquals(-2900f, heavyDischargeSample.currentSignedMa, 0.1f)
         assertTrue("Expected ~-11.7 W discharge power, got ${heavyDischargeSample.powerSignedWatts}", heavyDischargeSample.powerSignedWatts in -12.0f..-11.4f)
+
+        // Verified legacy pre-Q Samsung mA HAL exception converts cleanly at collection time to canonical µA
+        val legacyChargeUa = com.example.data.hardware.BatteryHardwareReader.normalizeCurrentReadingToMicroAmps(
+            raw = 4_300L,
+            isCharging = true,
+            halUsesMicroAmps = false,
+            isLegacyMilliampHal = true
+        )
+        assertEquals(4_300_000L, legacyChargeUa)
     }
 
     @Test

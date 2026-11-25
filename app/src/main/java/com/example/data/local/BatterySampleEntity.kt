@@ -51,11 +51,10 @@ data class BatterySampleEntity(
     /**
      * Normalized current magnitude in milliamperes (mA).
      *
-     * Standard Android HALs (including modern flagship OEM HALs) report microamperes (µA),
-     * while some older OEM HALs report milliamperes directly (1..9,500 mA).
-     * Also heals legacy DB rows where sub-25 mA µA trickle readings (e.g. 14,784 µA)
-     * were previously over-multiplied by 1000 (>10.5 A is physically impossible on a
-     * single-cell smartphone battery).
+     * `currentMicroA` is stored in Android's canonical signed microampere (µA) unit so valid
+     * low-power standby readings (e.g. 8,000 µA = 8 mA = 0.032 W at 4 V) are preserved accurately.
+     * Legacy corrupted DB rows where a trickle µA reading was previously over-multiplied by 1000
+     * (>10.5 A is physically impossible on a single-cell smartphone battery) are still healed safely.
      */
     val currentAbsMa: Float
         get() {
@@ -63,7 +62,6 @@ data class BatterySampleEntity(
             return when {
                 raw == 0L -> 0f
                 raw > 10_500_000L -> raw / 1_000_000f
-                raw in 1L..9_500L -> raw.toFloat()
                 else -> raw / 1000f
             }
         }

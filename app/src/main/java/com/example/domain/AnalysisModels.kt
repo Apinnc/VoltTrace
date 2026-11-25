@@ -115,7 +115,8 @@ data class AppDrainAttribution(
     val shareOfTotalDrainPct: Float = 0f,
     val avgPowerMw: Float,
     val drainRatePctPerHour: Float,
-    val isHighIntensity: Boolean
+    val isHighIntensity: Boolean,
+    val hasEnergyEstimate: Boolean = true
 )
 
 data class ProbeSessionResult(
@@ -192,6 +193,7 @@ data class BatteryAnalysisReport(
     val mixedTransitionDurationMs: Long = 0L,
     val gapDurationMs: Long = 0L,
     val totalChargedMah: Float = 0f,
+    val netChargeDeltaMah: Float = totalChargedMah - totalDischargedMah,
     val peakDischargePowerMw: Float = 0f,
     val peakDischargePowerTimestampMs: Long? = null,
     val peakChargePowerMw: Float = 0f,
@@ -205,7 +207,7 @@ data class BatteryAnalysisReport(
     val totalUnpluggedDeepSleepMs: Long = 0L,
     val chargeCounterMeasured: Boolean = false,
     val missingClockSampleCount: Int = 0,
-    val hardwareAttributionMode: String = "Modeled Estimate (No Hardware Energy Meters Recorded)",
+    val hardwareAttributionMode: String = "Modeled Component Split (0 Hardware Energy Meters Recorded in Window)",
     val discoveredEnergyMeters: List<EnergyMeterSummary> = emptyList(),
     val drainEpisodes: List<DrainEpisode> = emptyList(),
     val estimatedRemainingHours: Float?,

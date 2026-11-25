@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.NightsStay
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
@@ -121,7 +122,8 @@ fun OvernightReplayBottomSheet(
 
     val safeIdx = cursorIdx.coerceIn(0, (samples.size - 1).coerceAtLeast(0))
     val activeSample = samples.getOrNull(safeIdx)
-    val isFallback = report.mode == OvernightReportMode.BEFORE_PLUGGED_IN
+    val isPrePlugFallback = report.mode == OvernightReportMode.BEFORE_PLUGGED_IN
+    val isRecentSession = report.mode == OvernightReportMode.RECENT_SESSION
     val keySeg = report.keySegment
 
     ModalBottomSheet(
@@ -153,13 +155,21 @@ fun OvernightReplayBottomSheet(
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         Icon(
-                            imageVector = if (isFallback) Icons.Filled.BatteryChargingFull else Icons.Filled.NightsStay,
+                            imageVector = when (report.mode) {
+                                OvernightReportMode.BEFORE_PLUGGED_IN -> Icons.Filled.BatteryChargingFull
+                                OvernightReportMode.RECENT_SESSION -> Icons.Filled.History
+                                else -> Icons.Filled.NightsStay
+                            },
                             contentDescription = null,
-                            tint = if (isFallback) telemetry.charging else MaterialTheme.colorScheme.primary,
+                            tint = if (isPrePlugFallback) telemetry.charging else MaterialTheme.colorScheme.primary,
                             modifier = Modifier.size(18.dp)
                         )
                         Text(
-                            text = if (isFallback) "Before You Plugged In — Replay" else "Overnight Replay",
+                            text = when (report.mode) {
+                                OvernightReportMode.BEFORE_PLUGGED_IN -> "Before You Plugged In — Replay"
+                                OvernightReportMode.RECENT_SESSION -> "Recent Session — Replay"
+                                else -> "Overnight Replay"
+                            },
                             style = MaterialTheme.typography.titleLarge,
                             color = MaterialTheme.colorScheme.onSurface
                         )
@@ -198,8 +208,13 @@ fun OvernightReplayBottomSheet(
                             detectTapGestures { offset ->
                                 isPlaying = false
                                 if (samples.isNotEmpty() && size.width > 0) {
-                                    val ratio = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
-                                    cursorIdx = (ratio * (samples.size - 1)).toInt()
+                                    val padPx = 10.dp.toPx()
+                                    val innerW = (size.width - padPx * 2f).coerceAtLeast(1f)
+                                    cursorIdx = nearestSampleIndexForTouchX(
+                                        touchX = offset.x - padPx,
+                                        width = innerW,
+                                        samples = samples
+                                    )
                                 }
                             }
                         }
@@ -207,8 +222,13 @@ fun OvernightReplayBottomSheet(
                             detectHorizontalDragGestures { change, _ ->
                                 isPlaying = false
                                 if (samples.isNotEmpty() && size.width > 0) {
-                                    val ratio = (change.position.x / size.width.toFloat()).coerceIn(0f, 1f)
-                                    cursorIdx = (ratio * (samples.size - 1)).toInt()
+                                    val padPx = 10.dp.toPx()
+                                    val innerW = (size.width - padPx * 2f).coerceAtLeast(1f)
+                                    cursorIdx = nearestSampleIndexForTouchX(
+                                        touchX = change.position.x - padPx,
+                                        width = innerW,
+                                        samples = samples
+                                    )
                                 }
                             }
                         }
@@ -218,7 +238,14 @@ fun OvernightReplayBottomSheet(
                         val w = size.width
                         val h = size.height
                         val count = samples.size
-                        val stepX = w / (count - 1).coerceAtLeast(1)
+                        val minTs = samples.first().timestampMs
+                        val spanMs = (samples.last().timestampMs - minTs).coerceAtLeast(0L)
+                        val fallbackStepX = w / (count - 1).coerceAtLeast(1)
+                        fun sampleX(idx: Int): Float = if (spanMs > 0L) {
+                            timelineTimestampToX(samples[idx].timestampMs, minTs, spanMs, w)
+                        } else {
+                            idx * fallbackStepX
+                        }
 
                         // Subtle gridlines
                         listOf(0.25f, 0.5f, 0.75f).forEach { frac ->
@@ -233,8 +260,8 @@ fun OvernightReplayBottomSheet(
 
                         // Highlight band for Key Segment ("which part of the night mattered")
                         if (keySeg != null) {
-                            val x1 = keySeg.startIndexInWindow * stepX
-                            val x2 = (keySeg.endIndexInWindow * stepX).coerceAtLeast(x1 + 8.dp.toPx())
+                            val x1 = sampleX(keySeg.startIndexInWindow.coerceIn(0, count - 1))
+                            val x2 = sampleX(keySeg.endIndexInWindow.coerceIn(0, count - 1)).coerceAtLeast(x1 + 8.dp.toPx())
                             drawRect(
                                 color = telemetry.critical.copy(alpha = 0.18f),
                                 topLeft = Offset(x1, 0f),
@@ -245,7 +272,7 @@ fun OvernightReplayBottomSheet(
                         // Power curve (amber)
                         val maxW = (samples.maxOfOrNull { it.powerWatts } ?: 1f).coerceAtLeast(1.0f)
                         val powerPts = samples.mapIndexed { idx, s ->
-                            val x = idx * stepX
+                            val x = sampleX(idx)
                             val y = h - ((s.powerWatts / maxW).coerceIn(0.05f, 0.94f) * h)
                             Offset(x, y)
                         }
@@ -264,7 +291,7 @@ fun OvernightReplayBottomSheet(
                         val maxPct = ((samples.maxOfOrNull { it.levelPct } ?: 100) + 1).coerceAtLeast(minPct + 2)
                         val pctSpan = (maxPct - minPct).toFloat()
                         val socPts = samples.mapIndexed { idx, s ->
-                            val x = idx * stepX
+                            val x = sampleX(idx)
                             val y = h - (((s.levelPct - minPct) / pctSpan).coerceIn(0.06f, 0.94f) * h)
                             Offset(x, y)
                         }
@@ -279,7 +306,7 @@ fun OvernightReplayBottomSheet(
                         )
 
                         // Active replay cursor
-                        val cx = safeIdx * stepX
+                        val cx = socPts[safeIdx].x
                         drawLine(
                             color = crosshairColor,
                             start = Offset(cx, 0f),

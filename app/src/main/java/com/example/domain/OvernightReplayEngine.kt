@@ -14,7 +14,14 @@ import kotlin.math.roundToInt
 enum class OvernightReportMode {
     OVERNIGHT_STANDBY,
     BEFORE_PLUGGED_IN,
+    RECENT_SESSION,
     AWAITING_DATA
+}
+
+enum class ChargeEvidenceSource {
+    COUNTER_MEASURED,
+    MIXED,
+    ESTIMATED
 }
 
 data class WatchInvestigationConfig(
@@ -27,6 +34,7 @@ data class WatchInvestigationConfig(
     val armedAtMs: Long = 0L,
     val matchCount: Int = 0,
     val lastMatchedAtMs: Long = 0L,
+    val lastMatchedEventId: String = "",
     val lastMatchSummary: String = ""
 )
 
@@ -50,6 +58,9 @@ data class OvernightKeySegment(
     val endMs: Long,
     val durationMs: Long,
     val chargeLostMah: Float,
+    val counterMeasuredMah: Float = 0f,
+    val estimatedMah: Float = 0f,
+    val chargeEvidenceSource: ChargeEvidenceSource = ChargeEvidenceSource.ESTIMATED,
     val counterMeasured: Boolean,
     val levelDropPct: Int,
     val shareOfNightLossPct: Float,
@@ -78,6 +89,9 @@ data class OvernightReplayReport(
     val endLevelPct: Int,
     val levelLostPct: Int,
     val chargeLostMah: Float,
+    val counterMeasuredMah: Float = 0f,
+    val estimatedMah: Float = 0f,
+    val chargeEvidenceSource: ChargeEvidenceSource = ChargeEvidenceSource.ESTIMATED,
     val counterMeasured: Boolean,
     val drainRatePctPerHour: Float,
     val deepSleepMs: Long?,
@@ -96,7 +110,9 @@ data class OvernightReplayReport(
     val suggestedTriggerRatePctHr: Float,
     val suggestedTriggerPeakMw: Float,
     val watchTriggeredThisWindow: Boolean,
-    val watchMatchReason: String?
+    val watchMatchReason: String?,
+    val watchMatchEventId: String? = null,
+    val watchMatchEventTimestampMs: Long? = null
 )
 
 /**
@@ -115,6 +131,12 @@ object OvernightReplayEngine {
     private const val MIN_FALLBACK_MS = 20L * 60_000L
     private const val MAX_INTERVAL_GAP_MS = 4L * 60L * 60_000L
 
+    private data class LocalNightWindow(
+        val nightKey: String,
+        val startMs: Long,
+        val endMs: Long
+    )
+
     private data class UnpluggedRun(
         val samples: List<BatterySampleEntity>,
         val startMs: Long,
@@ -123,6 +145,9 @@ object OvernightReplayEngine {
         val overnightOverlapMs: Long,
         val screenOffDurationMs: Long,
         val chargeLostMah: Float,
+        val counterMeasuredMah: Float,
+        val estimatedMah: Float,
+        val chargeEvidenceSource: ChargeEvidenceSource,
         val counterMeasured: Boolean,
         val startLevelPct: Int,
         val endLevelPct: Int,
@@ -131,7 +156,15 @@ object OvernightReplayEngine {
         val deepSleepMs: Long?,
         val cpuAwakeMs: Long?,
         val deepSleepPct: Float?,
-        val pluggedInAtMs: Long?
+        val pluggedInAtMs: Long?,
+        val nightKey: String? = null
+    )
+
+    private data class WatchMatchEvaluation(
+        val triggered: Boolean,
+        val reason: String?,
+        val eventId: String?,
+        val eventTimestampMs: Long?
     )
 
     fun analyze(
@@ -147,57 +180,90 @@ object OvernightReplayEngine {
             return emptyReport(nowMs)
         }
 
-        val runs = extractUnpluggedRuns(sorted, ratedCapacityMah, timeZone)
-        if (runs.isEmpty()) {
+        val rawRuns = extractUnpluggedRuns(sorted, ratedCapacityMah, timeZone)
+        if (rawRuns.isEmpty()) {
             return emptyReport(nowMs)
         }
 
-        // Look within the last 24 hours relative to `nowMs` for the most recent night or fallback
-        val recentCutoffMs = nowMs - 24L * 60L * 60_000L
-        val recentRuns = runs.filter { it.endMs >= recentCutoffMs }
+        // Clip every unplugged stretch to distinct local night windows [21:00..10:00] so daytime
+        // drain is never attributed to overnight loss and multi-night spans split cleanly per night.
+        val clippedNightRuns = extractClippedLocalNightRuns(sorted, ratedCapacityMah, timeZone)
 
-        // Check if the phone spent >= 2 hours charging during the recent overnight window
-        val recentOvernightChargingMs = computeOvernightChargingMs(
+        val recentCutoffMs = nowMs - 24L * 60L * 60_000L
+
+        // 1. Primary: genuine clipped local-night standby run (>= 2h inside the local night,
+        //    >= 45% screen-off, and NOT superseded by >= 2h overnight charging during that same night).
+        val qualifyingRecentNights = clippedNightRuns.filter { run ->
+            if (run.endMs < recentCutoffMs) return@filter false
+            val nightWin = run.nightKey?.let { localNightWindowForKey(it, timeZone) }
+            val nightChargingMs = if (nightWin != null) {
+                computeChargingMsInRange(sorted, nightWin.startMs, nightWin.endMs)
+            } else {
+                0L
+            }
+            val followedByOvernightCharge = run.pluggedInAtMs != null && nightChargingMs >= 2L * 60L * 60_000L
+            !followedByOvernightCharge &&
+                run.durationMs >= 2L * 60L * 60_000L &&
+                run.overnightOverlapMs >= 2L * 60L * 60_000L &&
+                run.screenOffDurationMs >= (run.durationMs * 0.45f).toLong()
+        }
+        // Prefer the most recent local night (not an earlier night with slightly longer duration)
+        val overnightCandidate = qualifyingRecentNights
+            .groupBy { it.nightKey }
+            .maxByOrNull { (_, runsInNight) -> runsInNight.maxOf { it.endMs } }
+            ?.value
+            ?.maxByOrNull { it.durationMs }
+
+        // 2. Fallback: require an observed plug-in/charging transition for "Before you plugged in";
+        //    otherwise show a neutral "Recent Session" report without claiming the phone charged overnight.
+        val recentChargingMs = computeOvernightChargingMs(
             sorted = sorted,
-            sinceMs = recentCutoffMs,
+            sinceMs = nowMs - 36L * 60L * 60_000L,
             timeZone = timeZone
         )
-
-        // 1. Primary: genuine unplugged overnight standby run (>= 2h overnight overlap, >= 50% screen-off,
-        //    and NOT superseded by a multi-hour overnight charging session right after it)
-        val overnightCandidate = recentRuns
-            .filter { run ->
-                val followedByOvernightCharge = run.pluggedInAtMs != null && recentOvernightChargingMs >= 2L * 60L * 60_000L
-                !followedByOvernightCharge &&
-                    run.durationMs >= MIN_OVERNIGHT_MS &&
-                    run.overnightOverlapMs >= 2L * 60L * 60_000L &&
-                    run.screenOffDurationMs >= (run.durationMs * 0.45f).toLong()
-            }
-            .maxByOrNull { it.overnightOverlapMs + it.durationMs / 2L }
-
-        // 2. Fallback: "Before you plugged in" — phone charged overnight or recently; pick latest meaningful unplugged stretch before plug-in
         val (selectedRun, mode) = if (overnightCandidate != null) {
             overnightCandidate to OvernightReportMode.OVERNIGHT_STANDBY
         } else {
-            val prePlugCandidate = runs
+            val fallbackCandidate = rawRuns
                 .filter { run ->
                     run.endMs >= (nowMs - 48L * 60L * 60_000L) &&
                         (run.durationMs >= MIN_FALLBACK_MS || run.chargeLostMah >= 15f)
                 }
                 .maxByOrNull { it.endMs }
-            if (prePlugCandidate != null) {
-                prePlugCandidate to OvernightReportMode.BEFORE_PLUGGED_IN
+            if (fallbackCandidate != null) {
+                val observedPlugIn = fallbackCandidate.pluggedInAtMs != null ||
+                    (recentChargingMs > 0L && sorted.any { it.isCharging && it.timestampMs >= fallbackCandidate.endMs })
+                val fallbackMode = if (observedPlugIn) {
+                    OvernightReportMode.BEFORE_PLUGGED_IN
+                } else {
+                    OvernightReportMode.RECENT_SESSION
+                }
+                fallbackCandidate to fallbackMode
             } else {
                 return emptyReport(nowMs)
             }
         }
 
-        // 3. Personal Baseline from prior distinct nights (excluding selectedRun)
-        val priorNights = runs.filter { run ->
-            run.endMs < selectedRun.startMs - 60L * 60_000L &&
-                run.durationMs >= MIN_OVERNIGHT_MS &&
-                (run.overnightOverlapMs >= MIN_OVERNIGHT_MS || run.screenOffDurationMs >= 45L * 60_000L)
-        }.takeLast(14)
+        // 3. Personal Baseline strictly from prior DISTINCT local nights (never daytime sessions)
+        val currentNightKey = selectedRun.nightKey
+        val priorNights = clippedNightRuns
+            .filter { run ->
+                val nk = run.nightKey ?: return@filter false
+                val isStrictlyEarlierNight = if (currentNightKey != null) {
+                    nk < currentNightKey
+                } else {
+                    run.endMs < selectedRun.startMs - 60L * 60_000L
+                }
+                isStrictlyEarlierNight &&
+                    run.durationMs >= MIN_OVERNIGHT_MS &&
+                    run.overnightOverlapMs >= MIN_OVERNIGHT_MS &&
+                    run.screenOffDurationMs >= (run.durationMs * 0.45f).toLong()
+            }
+            .groupBy { it.nightKey!! }
+            .toSortedMap()
+            .values
+            .map { runsInNight -> runsInNight.maxByOrNull { it.durationMs }!! }
+            .takeLast(14)
 
         val baseline = computeBaseline(selectedRun, priorNights)
 
@@ -224,18 +290,40 @@ object OvernightReplayEngine {
 
         // 6. Plain-English "What the phone actually recorded" summary (scannable in < 5 seconds)
         val recordedSummary = buildList {
-            val counterTag = if (selectedRun.counterMeasured) "battery charge counter" else "SOC percentage estimate"
-            add(
-                String.format(
-                    Locale.US,
-                    "Measured -%.0f mAh (%d%% → %d%%) via %s across %d samples.",
-                    selectedRun.chargeLostMah,
-                    selectedRun.startLevelPct,
-                    selectedRun.endLevelPct,
-                    counterTag,
-                    selectedRun.samples.size
+            when (selectedRun.chargeEvidenceSource) {
+                ChargeEvidenceSource.COUNTER_MEASURED -> add(
+                    String.format(
+                        Locale.US,
+                        "Measured -%.0f mAh (%d%% → %d%%) via battery charge counter across %d samples.",
+                        selectedRun.chargeLostMah,
+                        selectedRun.startLevelPct,
+                        selectedRun.endLevelPct,
+                        selectedRun.samples.size
+                    )
                 )
-            )
+                ChargeEvidenceSource.MIXED -> add(
+                    String.format(
+                        Locale.US,
+                        "Recorded -%.0f mAh (%d%% → %d%%) via mixed evidence (%.0f mAh charge counter + %.0f mAh SOC estimate) across %d samples.",
+                        selectedRun.chargeLostMah,
+                        selectedRun.startLevelPct,
+                        selectedRun.endLevelPct,
+                        selectedRun.counterMeasuredMah,
+                        selectedRun.estimatedMah,
+                        selectedRun.samples.size
+                    )
+                )
+                ChargeEvidenceSource.ESTIMATED -> add(
+                    String.format(
+                        Locale.US,
+                        "Estimated -%.0f mAh (%d%% → %d%%) via SOC percentage estimate across %d samples.",
+                        selectedRun.chargeLostMah,
+                        selectedRun.startLevelPct,
+                        selectedRun.endLevelPct,
+                        selectedRun.samples.size
+                    )
+                )
+            }
             if (selectedRun.deepSleepMs != null && selectedRun.cpuAwakeMs != null && selectedRun.deepSleepPct != null) {
                 add(
                     String.format(
@@ -304,12 +392,12 @@ object OvernightReplayEngine {
         } ?: "Overnight"
         val suggestedTitle = "Watch: $suggestedSuspect ($keyTimeRange)"
 
-        // 8. Evaluate if an already-armed "Watch for this again" investigation triggered on THIS window
-        val (watchTriggered, watchMatchReason) = evaluateWatchMatch(
+        // 8. Evaluate if an already-armed "Watch for this again" investigation triggered on POST-ARM evidence
+        val watchEval = evaluateWatchMatch(
             watchConfig = watchConfig,
             run = selectedRun,
-            peakMw = peakMw,
-            keySegment = keySegment
+            segments = segments,
+            ratedCapacityMah = ratedCapacityMah
         )
 
         return OvernightReplayReport(
@@ -323,6 +411,9 @@ object OvernightReplayEngine {
             endLevelPct = selectedRun.endLevelPct,
             levelLostPct = selectedRun.levelLostPct,
             chargeLostMah = selectedRun.chargeLostMah,
+            counterMeasuredMah = selectedRun.counterMeasuredMah,
+            estimatedMah = selectedRun.estimatedMah,
+            chargeEvidenceSource = selectedRun.chargeEvidenceSource,
             counterMeasured = selectedRun.counterMeasured,
             drainRatePctPerHour = selectedRun.drainRatePctPerHour,
             deepSleepMs = selectedRun.deepSleepMs,
@@ -340,9 +431,33 @@ object OvernightReplayEngine {
             suggestedWatchPackage = suggestedPkg,
             suggestedTriggerRatePctHr = suggestedTriggerRate,
             suggestedTriggerPeakMw = suggestedTriggerPeakMw,
-            watchTriggeredThisWindow = watchTriggered,
-            watchMatchReason = watchMatchReason
+            watchTriggeredThisWindow = watchEval.triggered,
+            watchMatchReason = watchEval.reason,
+            watchMatchEventId = watchEval.eventId,
+            watchMatchEventTimestampMs = watchEval.eventTimestampMs
         )
+    }
+
+    private fun computeChargingMsInRange(
+        sorted: List<BatterySampleEntity>,
+        rangeStartMs: Long,
+        rangeEndMs: Long
+    ): Long {
+        var total = 0L
+        for (i in 0 until sorted.size - 1) {
+            val a = sorted[i]
+            val b = sorted[i + 1]
+            val dt = b.timestampMs - a.timestampMs
+            if (dt <= 0L || dt > 12L * 60L * 60_000L) continue
+            if (a.isCharging && b.isCharging) {
+                val overlapStart = max(a.timestampMs, rangeStartMs)
+                val overlapEnd = minOf(b.timestampMs, rangeEndMs)
+                if (overlapEnd > overlapStart) {
+                    total += (overlapEnd - overlapStart)
+                }
+            }
+        }
+        return total
     }
 
     private fun computeOvernightChargingMs(
@@ -369,12 +484,43 @@ object OvernightReplayEngine {
         ratedCapacityMah: Int,
         timeZone: TimeZone
     ): List<UnpluggedRun> {
-        val runs = mutableListOf<UnpluggedRun>()
+        val stretches = extractRawUnpluggedStretches(sorted)
+        return stretches.mapNotNull { (slice, pluggedInAtMs) ->
+            buildRun(slice, ratedCapacityMah, timeZone, pluggedInAtMs, nightKey = null)
+        }
+    }
+
+    private fun extractClippedLocalNightRuns(
+        sorted: List<BatterySampleEntity>,
+        ratedCapacityMah: Int,
+        timeZone: TimeZone
+    ): List<UnpluggedRun> {
+        val stretches = extractRawUnpluggedStretches(sorted)
+        val results = mutableListOf<UnpluggedRun>()
+        for ((slice, pluggedInAtMs) in stretches) {
+            if (slice.size < 2) continue
+            val nights = overlappingLocalNights(slice.first().timestampMs, slice.last().timestampMs, timeZone)
+            for (night in nights) {
+                val clipped = clipSamplesToWindow(slice, night.startMs, night.endMs)
+                if (clipped.size < 2) continue
+                val nightPlugIn = pluggedInAtMs?.takeIf { it in night.startMs..(night.endMs + 15L * 60_000L) }
+                buildRun(clipped, ratedCapacityMah, timeZone, nightPlugIn, nightKey = night.nightKey)?.let {
+                    results.add(it)
+                }
+            }
+        }
+        return results
+    }
+
+    private fun extractRawUnpluggedStretches(
+        sorted: List<BatterySampleEntity>
+    ): List<Pair<List<BatterySampleEntity>, Long?>> {
+        val stretches = mutableListOf<Pair<List<BatterySampleEntity>, Long?>>()
         var current = mutableListOf<BatterySampleEntity>()
 
         fun flush(pluggedInAtMs: Long?) {
             if (current.size >= 2) {
-                buildRun(current.toList(), ratedCapacityMah, timeZone, pluggedInAtMs)?.let { runs.add(it) }
+                stretches.add(current.toList() to pluggedInAtMs)
             }
             current = mutableListOf()
         }
@@ -392,14 +538,151 @@ object OvernightReplayEngine {
             }
         }
         flush(pluggedInAtMs = null)
-        return runs
+        return stretches
+    }
+
+    private fun overlappingLocalNights(
+        startMs: Long,
+        endMs: Long,
+        timeZone: TimeZone
+    ): List<LocalNightWindow> {
+        if (endMs <= startMs) return emptyList()
+        val cal = Calendar.getInstance(timeZone).apply {
+            timeInMillis = startMs
+            set(Calendar.HOUR_OF_DAY, 21)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+            add(Calendar.DAY_OF_YEAR, -1)
+        }
+        val keyFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { this.timeZone = timeZone }
+        val windows = mutableListOf<LocalNightWindow>()
+        while (cal.timeInMillis <= endMs) {
+            val winStart = cal.timeInMillis
+            val key = keyFmt.format(Date(winStart))
+            val endCal = (cal.clone() as Calendar).apply {
+                add(Calendar.DAY_OF_YEAR, 1)
+                set(Calendar.HOUR_OF_DAY, 10)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+            val winEnd = endCal.timeInMillis
+            if (winEnd > startMs && winStart < endMs) {
+                windows.add(LocalNightWindow(nightKey = key, startMs = winStart, endMs = winEnd))
+            }
+            cal.add(Calendar.DAY_OF_YEAR, 1)
+        }
+        return windows
+    }
+
+    private fun localNightWindowForKey(nightKey: String, timeZone: TimeZone): LocalNightWindow? {
+        val parts = nightKey.split("-")
+        if (parts.size != 3) return null
+        val y = parts[0].toIntOrNull() ?: return null
+        val m = parts[1].toIntOrNull() ?: return null
+        val d = parts[2].toIntOrNull() ?: return null
+        val startCal = Calendar.getInstance(timeZone).apply {
+            set(Calendar.YEAR, y)
+            set(Calendar.MONTH, m - 1)
+            set(Calendar.DAY_OF_MONTH, d)
+            set(Calendar.HOUR_OF_DAY, 21)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        val endCal = (startCal.clone() as Calendar).apply {
+            add(Calendar.DAY_OF_YEAR, 1)
+            set(Calendar.HOUR_OF_DAY, 10)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        return LocalNightWindow(nightKey = nightKey, startMs = startCal.timeInMillis, endMs = endCal.timeInMillis)
+    }
+
+    private fun clipSamplesToWindow(
+        slice: List<BatterySampleEntity>,
+        windowStartMs: Long,
+        windowEndMs: Long
+    ): List<BatterySampleEntity> {
+        val inside = slice.filter { it.timestampMs in windowStartMs..windowEndMs }.toMutableList()
+
+        // If an interval crosses windowStartMs without an exact sample at windowStartMs, interpolate the boundary
+        val hasExactStart = inside.firstOrNull()?.timestampMs == windowStartMs
+        if (!hasExactStart) {
+            val beforeStart = slice.lastOrNull { it.timestampMs < windowStartMs }
+            val afterStart = slice.firstOrNull { it.timestampMs > windowStartMs }
+            if (beforeStart != null && afterStart != null &&
+                (afterStart.timestampMs - beforeStart.timestampMs) <= MAX_INTERVAL_GAP_MS
+            ) {
+                inside.add(0, interpolateBoundarySample(beforeStart, afterStart, windowStartMs))
+            }
+        }
+
+        // If an interval crosses windowEndMs without an exact sample at windowEndMs, interpolate the boundary
+        val hasExactEnd = inside.lastOrNull()?.timestampMs == windowEndMs
+        if (!hasExactEnd) {
+            val beforeEnd = slice.lastOrNull { it.timestampMs < windowEndMs }
+            val afterEnd = slice.firstOrNull { it.timestampMs > windowEndMs }
+            if (beforeEnd != null && afterEnd != null &&
+                (afterEnd.timestampMs - beforeEnd.timestampMs) <= MAX_INTERVAL_GAP_MS
+            ) {
+                inside.add(interpolateBoundarySample(beforeEnd, afterEnd, windowEndMs))
+            }
+        }
+
+        return inside.distinctBy { it.timestampMs }.sortedBy { it.timestampMs }
+    }
+
+    private fun interpolateBoundarySample(
+        a: BatterySampleEntity,
+        b: BatterySampleEntity,
+        targetTs: Long
+    ): BatterySampleEntity {
+        val span = (b.timestampMs - a.timestampMs).coerceAtLeast(1L)
+        val frac = ((targetTs - a.timestampMs).toDouble() / span.toDouble()).coerceIn(0.0, 1.0)
+        val level = (a.levelPct + (b.levelPct - a.levelPct) * frac).roundToInt()
+        val voltage = (a.voltageMv + (b.voltageMv - a.voltageMv) * frac).roundToInt()
+        val temp = (a.temperatureDeciC + (b.temperatureDeciC - a.temperatureDeciC) * frac).roundToInt()
+        val current = (a.currentMicroA + (b.currentMicroA - a.currentMicroA) * frac).toLong()
+        val counter = if (a.chargeCounterMicroAh > 0L && b.chargeCounterMicroAh > 0L) {
+            (a.chargeCounterMicroAh + (b.chargeCounterMicroAh - a.chargeCounterMicroAh) * frac).toLong()
+        } else {
+            0L
+        }
+        val validClocks = a.elapsedRealtimeMs > 0L && b.elapsedRealtimeMs > a.elapsedRealtimeMs &&
+            a.uptimeMs > 0L && b.uptimeMs >= a.uptimeMs
+        val elapsed = if (validClocks) {
+            (a.elapsedRealtimeMs + (b.elapsedRealtimeMs - a.elapsedRealtimeMs) * frac).toLong()
+        } else {
+            0L
+        }
+        val uptime = if (validClocks) {
+            (a.uptimeMs + (b.uptimeMs - a.uptimeMs) * frac).toLong()
+        } else {
+            0L
+        }
+        val template = if (frac >= 0.5) b else a
+        return template.copy(
+            id = 0L,
+            timestampMs = targetTs,
+            levelPct = level,
+            voltageMv = voltage,
+            temperatureDeciC = temp,
+            currentMicroA = current,
+            chargeCounterMicroAh = counter,
+            elapsedRealtimeMs = elapsed,
+            uptimeMs = uptime
+        )
     }
 
     private fun buildRun(
         samples: List<BatterySampleEntity>,
         ratedCapacityMah: Int,
         timeZone: TimeZone,
-        pluggedInAtMs: Long?
+        pluggedInAtMs: Long?,
+        nightKey: String?
     ): UnpluggedRun? {
         if (samples.size < 2) return null
         val startMs = samples.first().timestampMs
@@ -407,8 +690,10 @@ object OvernightReplayEngine {
         val durationMs = endMs - startMs
         if (durationMs <= 0L) return null
 
-        var totalMah = 0f
-        var counterUsed = false
+        var counterMeasuredMah = 0f
+        var estimatedMah = 0f
+        var counterIntervalCount = 0
+        var estimatedIntervalCount = 0
         var screenOffMs = 0L
         var overnightOverlapMs = 0L
         var validElapsedMs = 0L
@@ -421,8 +706,13 @@ object OvernightReplayEngine {
             if (dt <= 0L || dt > MAX_INTERVAL_GAP_MS) continue
 
             val (pairMah, isCounter) = pairChargeLoss(a, b, ratedCapacityMah)
-            totalMah += pairMah
-            if (isCounter) counterUsed = true
+            if (isCounter) {
+                counterMeasuredMah += pairMah
+                counterIntervalCount++
+            } else {
+                estimatedMah += pairMah
+                estimatedIntervalCount++
+            }
 
             if (!a.isScreenOn && !b.isScreenOn) {
                 screenOffMs += dt
@@ -441,11 +731,20 @@ object OvernightReplayEngine {
             }
         }
 
+        val totalMah = counterMeasuredMah + estimatedMah
+        val evidenceSource = resolveChargeEvidenceSource(
+            counterMeasuredMah = counterMeasuredMah,
+            estimatedMah = estimatedMah,
+            counterIntervals = counterIntervalCount,
+            estimatedIntervals = estimatedIntervalCount
+        )
+        val counterUsedOnly = evidenceSource == ChargeEvidenceSource.COUNTER_MEASURED
+
         val startPct = samples.first().levelPct
         val endPct = samples.last().levelPct
         val levelLost = (startPct - endPct).coerceAtLeast(0)
         val hours = durationMs / 3_600_000f
-        val effectivePctDrop = if (counterUsed && ratedCapacityMah > 0) {
+        val effectivePctDrop = if (evidenceSource != ChargeEvidenceSource.ESTIMATED && ratedCapacityMah > 0) {
             (totalMah / ratedCapacityMah.toFloat()) * 100f
         } else {
             levelLost.toFloat()
@@ -468,7 +767,10 @@ object OvernightReplayEngine {
             overnightOverlapMs = overnightOverlapMs,
             screenOffDurationMs = screenOffMs,
             chargeLostMah = totalMah,
-            counterMeasured = counterUsed,
+            counterMeasuredMah = counterMeasuredMah,
+            estimatedMah = estimatedMah,
+            chargeEvidenceSource = evidenceSource,
+            counterMeasured = counterUsedOnly,
             startLevelPct = startPct,
             endLevelPct = endPct,
             levelLostPct = levelLost,
@@ -476,8 +778,25 @@ object OvernightReplayEngine {
             deepSleepMs = deepSleepMs,
             cpuAwakeMs = cpuAwakeMs,
             deepSleepPct = deepSleepPct,
-            pluggedInAtMs = pluggedInAtMs
+            pluggedInAtMs = pluggedInAtMs,
+            nightKey = nightKey
         )
+    }
+
+    private fun resolveChargeEvidenceSource(
+        counterMeasuredMah: Float,
+        estimatedMah: Float,
+        counterIntervals: Int,
+        estimatedIntervals: Int
+    ): ChargeEvidenceSource {
+        return when {
+            counterMeasuredMah > 0.01f && estimatedMah > 0.01f -> ChargeEvidenceSource.MIXED
+            counterMeasuredMah > 0.01f -> ChargeEvidenceSource.COUNTER_MEASURED
+            estimatedMah > 0.01f -> ChargeEvidenceSource.ESTIMATED
+            counterIntervals > 0 && estimatedIntervals == 0 -> ChargeEvidenceSource.COUNTER_MEASURED
+            counterIntervals > 0 && estimatedIntervals > 0 -> ChargeEvidenceSource.MIXED
+            else -> ChargeEvidenceSource.ESTIMATED
+        }
     }
 
     private fun computeBaseline(
@@ -648,8 +967,16 @@ object OvernightReplayEngine {
             val eIdx = grp.last().endIdx
             val startSample = samples[sIdx]
             val endSample = samples[eIdx]
-            val segMah = grp.sumOf { it.mah.toDouble() }.toFloat()
-            val segCounter = grp.any { it.counter }
+            val segCounterMah = grp.filter { it.counter }.sumOf { it.mah.toDouble() }.toFloat()
+            val segEstimatedMah = grp.filterNot { it.counter }.sumOf { it.mah.toDouble() }.toFloat()
+            val segMah = segCounterMah + segEstimatedMah
+            val segEvidenceSource = resolveChargeEvidenceSource(
+                counterMeasuredMah = segCounterMah,
+                estimatedMah = segEstimatedMah,
+                counterIntervals = grp.count { it.counter },
+                estimatedIntervals = grp.count { !it.counter }
+            )
+            val segCounter = segEvidenceSource == ChargeEvidenceSource.COUNTER_MEASURED
             val segDuration = (endSample.timestampMs - startSample.timestampMs).coerceAtLeast(1L)
             val bestPeak = grp.maxByOrNull { it.peakMw } ?: grp.first()
             val peakSample = samples[bestPeak.peakIdx]
@@ -670,9 +997,16 @@ object OvernightReplayEngine {
             }.distinct()
             val fgPkg = segSlice.mapNotNull { it.foregroundPackage?.takeIf { p -> p.isNotBlank() } }.firstOrNull()
 
-            val matchingAppEvents = appEvents.filter { ev ->
-                ev.timestampMs in (startSample.timestampMs - 10L * 60_000L)..(endSample.timestampMs + 10L * 60_000L)
-            }.sortedByDescending { it.foregroundMs }
+            // Strictly intersect stored AppDrainEvent intervals [start, end] with [startSample, endSample]
+            val matchingAppEvents = appEvents.mapNotNull { ev ->
+                val evEnd = ev.timestampMs
+                val evDur = ev.intervalDurationMs.coerceAtLeast(1L)
+                val evStart = evEnd - evDur
+                val overlapMs = minOf(evEnd, endSample.timestampMs) - max(evStart, startSample.timestampMs)
+                if (overlapMs <= 0L) null else ev to overlapMs
+            }.sortedByDescending { (ev, overlapMs) ->
+                minOf(ev.foregroundMs, overlapMs)
+            }.map { (ev, _) -> ev }
 
             val suspectLabel = fgLabels.firstOrNull() ?: matchingAppEvents.firstOrNull()?.appLabel
             val suspectPackage = fgPkg ?: matchingAppEvents.firstOrNull()?.packageName
@@ -771,6 +1105,9 @@ object OvernightReplayEngine {
                 endMs = endSample.timestampMs,
                 durationMs = segDuration,
                 chargeLostMah = segMah,
+                counterMeasuredMah = segCounterMah,
+                estimatedMah = segEstimatedMah,
+                chargeEvidenceSource = segEvidenceSource,
                 counterMeasured = segCounter,
                 levelDropPct = (startSample.levelPct - endSample.levelPct).coerceAtLeast(0),
                 shareOfNightLossPct = sharePct,
@@ -793,45 +1130,121 @@ object OvernightReplayEngine {
     private fun evaluateWatchMatch(
         watchConfig: WatchInvestigationConfig,
         run: UnpluggedRun,
-        peakMw: Float,
-        keySegment: OvernightKeySegment?
-    ): Pair<Boolean, String?> {
-        if (!watchConfig.active) return false to null
-        // Only evaluate runs that ended AFTER the watch was armed
-        if (run.endMs <= watchConfig.armedAtMs) return false to null
+        segments: List<OvernightKeySegment>,
+        ratedCapacityMah: Int
+    ): WatchMatchEvaluation {
+        if (!watchConfig.active) {
+            return WatchMatchEvaluation(false, null, null, null)
+        }
+        val armedAt = watchConfig.armedAtMs
+        // Strictly evaluate readings recorded AFTER the watch was armed so old spikes never match.
+        val postArmSamples = run.samples.filter { it.timestampMs > armedAt }
+        if (postArmSamples.isEmpty()) {
+            return WatchMatchEvaluation(false, null, null, null)
+        }
 
         val reasons = mutableListOf<String>()
-        if (run.drainRatePctPerHour >= watchConfig.triggerDrainPctPerHour) {
+        var anchorEventId: String? = null
+        var anchorEventTs: Long? = null
+
+        // 1. Post-arm discharge rate check (strictly from post-arm intervals, >= 15 min span)
+        val postArmRate = if (run.startMs >= armedAt) {
+            run.drainRatePctPerHour
+        } else if (postArmSamples.size >= 2) {
+            val postSpanMs = postArmSamples.last().timestampMs - postArmSamples.first().timestampMs
+            if (postSpanMs >= 15L * 60_000L) {
+                var postMah = 0f
+                var anyCounter = false
+                for (i in 0 until postArmSamples.lastIndex) {
+                    val (mah, isCounter) = pairChargeLoss(postArmSamples[i], postArmSamples[i + 1], ratedCapacityMah)
+                    postMah += mah
+                    if (isCounter) anyCounter = true
+                }
+                val pctDrop = if (anyCounter && ratedCapacityMah > 0) {
+                    (postMah / ratedCapacityMah.toFloat()) * 100f
+                } else {
+                    (postArmSamples.first().levelPct - postArmSamples.last().levelPct).coerceAtLeast(0).toFloat()
+                }
+                pctDrop / (postSpanMs / 3_600_000f)
+            } else {
+                0f
+            }
+        } else {
+            0f
+        }
+
+        if (postArmRate >= watchConfig.triggerDrainPctPerHour) {
             reasons.add(
                 String.format(
                     Locale.US,
                     "Standby drain hit %.1f%%/hr (watch threshold ≥ %.1f%%/hr)",
-                    run.drainRatePctPerHour,
+                    postArmRate,
                     watchConfig.triggerDrainPctPerHour
                 )
             )
+            val rateStartMs = if (run.startMs >= armedAt) run.startMs else postArmSamples.first().timestampMs
+            anchorEventId = "watch_rate_$rateStartMs"
+            anchorEventTs = rateStartMs
         }
-        if (peakMw >= watchConfig.triggerPeakMw) {
+
+        // 2. Post-arm peak check with honest screen-state labeling
+        val postArmDischarging = postArmSamples.filter { !it.isCharging }
+        val postArmScreenOffPeak = postArmDischarging.filter { !it.isScreenOn }.maxByOrNull { it.powerMw }
+        val postArmAnyPeak = postArmDischarging.maxByOrNull { it.powerMw }
+        val triggeringPeak = when {
+            postArmScreenOffPeak != null && postArmScreenOffPeak.powerMw >= watchConfig.triggerPeakMw -> postArmScreenOffPeak
+            postArmAnyPeak != null && postArmAnyPeak.powerMw >= watchConfig.triggerPeakMw -> postArmAnyPeak
+            else -> null
+        }
+        if (triggeringPeak != null) {
+            val peakLabel = if (triggeringPeak.isScreenOn) "Screen-on peak" else "Screen-off peak"
             reasons.add(
                 String.format(
                     Locale.US,
-                    "Screen-off peak hit -%.2f W (watch threshold ≥ %.2f W)",
-                    peakMw / 1000f,
+                    "%s hit -%.2f W (watch threshold ≥ %.2f W)",
+                    peakLabel,
+                    triggeringPeak.powerMw / 1000f,
                     watchConfig.triggerPeakMw / 1000f
                 )
             )
-        }
-        val suspect = watchConfig.suspectLabel.trim()
-        if (suspect.isNotEmpty() && keySegment?.suspectLabel != null &&
-            keySegment.suspectLabel.equals(suspect, ignoreCase = true)
-        ) {
-            reasons.add("$suspect reappeared during the key drain window")
+            // Peak sample timestamp is stable across subsequent calm samples
+            anchorEventId = "watch_peak_${triggeringPeak.timestampMs}"
+            anchorEventTs = triggeringPeak.timestampMs
         }
 
-        return if (reasons.isNotEmpty()) {
-            true to reasons.joinToString(" · ")
+        // 3. Post-arm suspect reappearance check
+        val suspect = watchConfig.suspectLabel.trim()
+        if (suspect.isNotEmpty()) {
+            val matchingPostArmSample = postArmSamples.firstOrNull { s ->
+                val lbl = (s.foregroundLabel ?: s.foregroundPackage).orEmpty()
+                lbl.equals(suspect, ignoreCase = true) ||
+                    (watchConfig.suspectPackage != null && s.foregroundPackage == watchConfig.suspectPackage)
+            }
+            val matchingPostArmSeg = segments.firstOrNull { seg ->
+                seg.startMs >= armedAt && (
+                    seg.suspectLabel.equals(suspect, ignoreCase = true) ||
+                        (watchConfig.suspectPackage != null && seg.suspectPackage == watchConfig.suspectPackage)
+                    )
+            }
+            if (matchingPostArmSample != null || matchingPostArmSeg != null) {
+                reasons.add("$suspect reappeared after watch was armed")
+                if (anchorEventId == null) {
+                    val ts = matchingPostArmSample?.timestampMs ?: matchingPostArmSeg!!.startMs
+                    anchorEventId = "watch_suspect_${suspect.lowercase(Locale.US)}_$ts"
+                    anchorEventTs = ts
+                }
+            }
+        }
+
+        return if (reasons.isNotEmpty() && anchorEventId != null && anchorEventTs != null) {
+            WatchMatchEvaluation(
+                triggered = true,
+                reason = reasons.joinToString(" · "),
+                eventId = anchorEventId,
+                eventTimestampMs = anchorEventTs
+            )
         } else {
-            false to null
+            WatchMatchEvaluation(false, null, null, null)
         }
     }
 

@@ -18,6 +18,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.TrendingUp
 import androidx.compose.material.icons.filled.BatteryChargingFull
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.NightsStay
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.PlayArrow
@@ -48,6 +49,7 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.domain.CauseSeverity
+import com.example.domain.ChargeEvidenceSource
 import com.example.domain.OvernightReplayEngine
 import com.example.domain.OvernightReplayReport
 import com.example.domain.OvernightReportMode
@@ -68,13 +70,15 @@ fun OvernightMorningReportCard(
     modifier: Modifier = Modifier
 ) {
     val telemetry = LocalTelemetryColors.current
-    val isFallback = report.mode == OvernightReportMode.BEFORE_PLUGGED_IN
+    val isPrePlugFallback = report.mode == OvernightReportMode.BEFORE_PLUGGED_IN
+    val isRecentSession = report.mode == OvernightReportMode.RECENT_SESSION
     val isAwaiting = report.mode == OvernightReportMode.AWAITING_DATA
 
     val headerAccent = when {
         report.watchTriggeredThisWindow -> telemetry.critical
         report.baseline.isElevatedVsBaseline -> telemetry.warning
-        isFallback -> telemetry.charging
+        isPrePlugFallback -> telemetry.charging
+        isRecentSession -> MaterialTheme.colorScheme.primary
         isAwaiting -> MaterialTheme.colorScheme.onSurfaceVariant
         else -> telemetry.healthy
     }
@@ -116,7 +120,11 @@ fun OvernightMorningReportCard(
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         Icon(
-                            imageVector = if (isFallback) Icons.Filled.BatteryChargingFull else Icons.Filled.NightsStay,
+                            imageVector = when (report.mode) {
+                                OvernightReportMode.BEFORE_PLUGGED_IN -> Icons.Filled.BatteryChargingFull
+                                OvernightReportMode.RECENT_SESSION -> Icons.Filled.History
+                                else -> Icons.Filled.NightsStay
+                            },
                             contentDescription = null,
                             tint = headerAccent,
                             modifier = Modifier.size(15.dp)
@@ -125,6 +133,7 @@ fun OvernightMorningReportCard(
                             text = when (report.mode) {
                                 OvernightReportMode.OVERNIGHT_STANDBY -> stringResource(R.string.overnight_morning_report_badge)
                                 OvernightReportMode.BEFORE_PLUGGED_IN -> stringResource(R.string.overnight_before_plugged_in_badge)
+                                OvernightReportMode.RECENT_SESSION -> stringResource(R.string.overnight_recent_session_badge)
                                 OvernightReportMode.AWAITING_DATA -> stringResource(R.string.overnight_awaiting_badge)
                             },
                             style = MaterialTheme.typography.labelMedium,
@@ -157,8 +166,8 @@ fun OvernightMorningReportCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             } else {
-                // "Before you plugged in" clarity subtitle
-                if (isFallback) {
+                // Mode clarity subtitle (only claim plug-in when an observed plug-in occurred)
+                if (isPrePlugFallback) {
                     val pluggedClock = report.pluggedInAtMs?.let { OvernightReplayEngine.formatClock(it) }
                     Text(
                         text = if (pluggedClock != null) {
@@ -168,6 +177,12 @@ fun OvernightMorningReportCard(
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = telemetry.charging
+                    )
+                } else if (isRecentSession) {
+                    Text(
+                        text = "No full overnight standby window recorded yet — showing your most recent unplugged stretch.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
 
@@ -198,7 +213,16 @@ fun OvernightMorningReportCard(
                                     .testTag("overnight_loss_mah")
                             )
                         }
-                        val counterTag = if (report.counterMeasured) "Counter-measured" else "Estimated from %"
+                        val counterTag = when (report.chargeEvidenceSource) {
+                            ChargeEvidenceSource.COUNTER_MEASURED -> "Counter-measured"
+                            ChargeEvidenceSource.MIXED -> String.format(
+                                Locale.US,
+                                "Mixed (%.0f mAh counter + %.0f mAh est.)",
+                                report.counterMeasuredMah,
+                                report.estimatedMah
+                            )
+                            ChargeEvidenceSource.ESTIMATED -> "Estimated from %"
+                        }
                         val sleepTag = report.deepSleepPct?.let {
                             String.format(Locale.US, " · %.0f%% deep sleep", it)
                         }.orEmpty()
@@ -401,7 +425,7 @@ fun OvernightMorningReportCard(
                         )
                         Spacer(modifier = Modifier.size(6.dp))
                         Text(
-                            text = if (isFallback) {
+                            text = if (isPrePlugFallback || isRecentSession) {
                                 stringResource(R.string.action_replay_window)
                             } else {
                                 stringResource(R.string.action_replay_night)
@@ -474,12 +498,19 @@ private fun MiniOvernightSparkline(
             if (count < 2) return@Canvas
             val w = size.width
             val h = size.height
-            val stepX = w / (count - 1).coerceAtLeast(1)
+            val minTs = samples.first().timestampMs
+            val spanMs = (samples.last().timestampMs - minTs).coerceAtLeast(0L)
+            val fallbackStepX = w / (count - 1).coerceAtLeast(1)
+            fun sampleX(idx: Int): Float = if (spanMs > 0L) {
+                timelineTimestampToX(samples[idx].timestampMs, minTs, spanMs, w)
+            } else {
+                idx * fallbackStepX
+            }
 
             // Highlight band for the part of the night that mattered most
             if (keySeg != null) {
-                val x1 = keySeg.startIndexInWindow * stepX
-                val x2 = (keySeg.endIndexInWindow * stepX).coerceAtLeast(x1 + 6.dp.toPx())
+                val x1 = sampleX(keySeg.startIndexInWindow.coerceIn(0, count - 1))
+                val x2 = sampleX(keySeg.endIndexInWindow.coerceIn(0, count - 1)).coerceAtLeast(x1 + 6.dp.toPx())
                 drawRect(
                     color = highlightAccent.copy(alpha = 0.22f),
                     topLeft = Offset(x1, 0f),
@@ -491,7 +522,7 @@ private fun MiniOvernightSparkline(
             val maxW = (samples.maxOfOrNull { it.powerWatts } ?: 1f).coerceAtLeast(1.0f)
             val powerPath = Path()
             samples.forEachIndexed { idx, s ->
-                val x = idx * stepX
+                val x = sampleX(idx)
                 val y = h - ((s.powerWatts / maxW).coerceIn(0.05f, 0.95f) * h)
                 if (idx == 0) powerPath.moveTo(x, y) else powerPath.lineTo(x, y)
             }
@@ -507,7 +538,7 @@ private fun MiniOvernightSparkline(
             val pctSpan = (maxPct - minPct).toFloat()
             val socPath = Path()
             samples.forEachIndexed { idx, s ->
-                val x = idx * stepX
+                val x = sampleX(idx)
                 val y = h - (((s.levelPct - minPct) / pctSpan).coerceIn(0.05f, 0.95f) * h)
                 if (idx == 0) socPath.moveTo(x, y) else socPath.lineTo(x, y)
             }

@@ -71,6 +71,52 @@ enum class ChartOverlayMetric(val label: String) {
     VOLTAGE("Voltage (V)")
 }
 
+/**
+ * Maps a sample timestamp linearly onto horizontal chart width [0f..width] so uneven
+ * sampling intervals (e.g., 1-minute live bursts vs 2-hour standby gaps) render proportionally.
+ */
+internal fun timelineTimestampToX(
+    timestampMs: Long,
+    minTs: Long,
+    spanMs: Long,
+    width: Float
+): Float {
+    if (width <= 0f || spanMs <= 0L) return 0f
+    val frac = ((timestampMs - minTs).toDouble() / spanMs.toDouble()).toFloat().coerceIn(0f, 1f)
+    return frac * width
+}
+
+/**
+ * Resolves a horizontal touch/drag X coordinate to the index of the sample whose timestamp
+ * is nearest to that time position.
+ */
+internal fun nearestSampleIndexForTouchX(
+    touchX: Float,
+    width: Float,
+    samples: List<BatterySampleEntity>
+): Int {
+    if (samples.size <= 1 || width <= 0f) return 0
+    val minTs = samples.first().timestampMs
+    val maxTs = samples.last().timestampMs
+    val spanMs = maxTs - minTs
+    if (spanMs <= 0L) {
+        val ratio = (touchX / width).coerceIn(0f, 1f)
+        return (ratio * (samples.size - 1)).toInt().coerceIn(0, samples.lastIndex)
+    }
+    val frac = (touchX / width).coerceIn(0f, 1f).toDouble()
+    val targetTs = minTs + (frac * spanMs.toDouble()).toLong()
+    var bestIdx = 0
+    var bestDist = Long.MAX_VALUE
+    for (i in samples.indices) {
+        val dist = kotlin.math.abs(samples[i].timestampMs - targetTs)
+        if (dist < bestDist) {
+            bestDist = dist
+            bestIdx = i
+        }
+    }
+    return bestIdx
+}
+
 @Composable
 fun TimelineChartCard(
     samples: List<BatterySampleEntity>,
@@ -214,7 +260,7 @@ fun TimelineChartCard(
                 }
             }
 
-            // Dual-axis interactive Canvas chart
+            // Dual-axis interactive Canvas chart (timestamp-proportional horizontal axis)
             Box(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -225,16 +271,26 @@ fun TimelineChartCard(
                     .pointerInput(samples) {
                         detectTapGestures { offset ->
                             if (samples.isNotEmpty() && size.width > 0) {
-                                val ratio = (offset.x / size.width.toFloat()).coerceIn(0f, 1f)
-                                selectedIdx = (ratio * (samples.size - 1)).toInt()
+                                val padPx = 8.dp.toPx()
+                                val innerW = (size.width - padPx * 2f).coerceAtLeast(1f)
+                                selectedIdx = nearestSampleIndexForTouchX(
+                                    touchX = offset.x - padPx,
+                                    width = innerW,
+                                    samples = samples
+                                )
                             }
                         }
                     }
                     .pointerInput(samples) {
                         detectHorizontalDragGestures { change, _ ->
                             if (samples.isNotEmpty() && size.width > 0) {
-                                val ratio = (change.position.x / size.width.toFloat()).coerceIn(0f, 1f)
-                                selectedIdx = (ratio * (samples.size - 1)).toInt()
+                                val padPx = 8.dp.toPx()
+                                val innerW = (size.width - padPx * 2f).coerceAtLeast(1f)
+                                selectedIdx = nearestSampleIndexForTouchX(
+                                    touchX = change.position.x - padPx,
+                                    width = innerW,
+                                    samples = samples
+                                )
                             }
                         }
                     }
@@ -257,7 +313,14 @@ fun TimelineChartCard(
                         val w = size.width
                         val h = size.height
                         val count = samples.size
-                        val stepX = w / (count - 1).coerceAtLeast(1)
+                        val minTs = samples.first().timestampMs
+                        val spanMs = (samples.last().timestampMs - minTs).coerceAtLeast(0L)
+                        val fallbackStepX = w / (count - 1).coerceAtLeast(1)
+                        fun sampleX(idx: Int): Float = if (spanMs > 0L) {
+                            timelineTimestampToX(samples[idx].timestampMs, minTs, spanMs, w)
+                        } else {
+                            idx * fallbackStepX
+                        }
 
                         // Horizontal reference grid (25%, 50%, 75%)
                         listOf(0.25f, 0.5f, 0.75f).forEach { frac ->
@@ -280,10 +343,12 @@ fun TimelineChartCard(
                                 else -> null
                             }
                             if (bandColor != null) {
+                                val x1 = sampleX(i)
+                                val x2 = sampleX(i + 1)
                                 drawRect(
                                     color = bandColor,
-                                    topLeft = Offset(i * stepX, 0f),
-                                    size = Size(stepX, h)
+                                    topLeft = Offset(x1, 0f),
+                                    size = Size((x2 - x1).coerceAtLeast(0f), h)
                                 )
                             }
                         }
@@ -301,7 +366,7 @@ fun TimelineChartCard(
                         val secSpan = (secMax - secMin).coerceAtLeast(0.1f)
 
                         val secPoints = secValues.mapIndexed { i, v ->
-                            val x = i * stepX
+                            val x = sampleX(i)
                             val y = h - (((v - secMin) / secSpan).coerceIn(0.05f, 0.95f) * h)
                             Offset(x, y)
                         }
@@ -356,7 +421,7 @@ fun TimelineChartCard(
 
                         // Primary Battery % curve
                         val pctPoints = samples.mapIndexed { i, s ->
-                            val x = i * stepX
+                            val x = sampleX(i)
                             val y = h - ((s.levelPct.coerceIn(0, 100) / 100f) * h * 0.92f + h * 0.04f)
                             Offset(x, y)
                         }
@@ -392,7 +457,7 @@ fun TimelineChartCard(
                         )
 
                         // Scrubbing crosshair
-                        val cx = safeSelectedIdx * stepX
+                        val cx = pctPoints[safeSelectedIdx].x
                         val cy = pctPoints[safeSelectedIdx].y
                         drawLine(
                             color = crosshairColor,

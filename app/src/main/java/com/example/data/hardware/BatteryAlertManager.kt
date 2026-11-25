@@ -186,13 +186,15 @@ object BatteryAlertManager {
         context: Context,
         title: String,
         reason: String,
+        matchedEventId: String,
         matchedAtMs: Long,
         settings: UserMonitorSettings,
         preferences: MonitorPreferences
     ) {
         if (!settings.watchConfig.active) return
-        if (matchedAtMs <= settings.watchConfig.lastMatchedAtMs) return
-        preferences.recordWatchMatch(matchedAtMs, reason)
+        if (matchedEventId.isBlank() || matchedEventId == settings.watchConfig.lastMatchedEventId) return
+        if (matchedAtMs <= settings.watchConfig.armedAtMs || matchedAtMs <= settings.watchConfig.lastMatchedAtMs) return
+        preferences.recordWatchMatch(matchedEventId, matchedAtMs, reason)
         if (!settings.criticalAlertsEnabled || !hasNotificationPermission(context)) return
         ensureChannels(context)
         postCriticalNotification(

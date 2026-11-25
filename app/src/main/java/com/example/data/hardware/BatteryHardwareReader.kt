@@ -199,11 +199,11 @@ class BatteryHardwareReader(private val context: Context) {
      * Normalizes OEM current reporting to canonical signed microamperes (µA):
      * positive (+) when charging, negative (-) when discharging.
      *
-     * Auto-detects whether the device HAL reports µA (standard AOSP & modern OEM HALs)
-     * vs raw mA (legacy OEM HALs) by inspecting both CURRENT_NOW and
-     * CURRENT_AVERAGE. Any reading >= 10,000 proves µA units (since no single-cell phone
-     * battery draws >= 10 A continuously) and permanently prevents sub-25 mA trickle currents
-     * (e.g. 14,784 µA at 98% charge) from being mis-scaled 1000x into phantom 65 W spikes.
+     * Android documents BATTERY_PROPERTY_CURRENT_NOW and BATTERY_PROPERTY_CURRENT_AVERAGE
+     * in microamperes (µA). We preserve µA directly—including small valid standby currents
+     * like 8,000 µA (8 mA, 0.032 W at 4 V)—in both pre-calibration and post-calibration states.
+     * Only verified legacy pre-Android 10 Samsung HALs known to report raw mA are scaled by 1000x
+     * when no µA-scale reading has ever been observed.
      */
     private fun normalizeCurrentToMicroAmps(raw: Long, rawAvg: Long, isCharging: Boolean): Long {
         val absRaw = abs(raw)
@@ -212,21 +212,15 @@ class BatteryHardwareReader(private val context: Context) {
             halUsesMicroAmps = true
             halPrefs.edit().putBoolean("hal_uses_micro_amps", true).apply()
         }
-        if (absRaw == 0L) return 0L
-
-        val isSamsung = Build.MANUFACTURER.equals("samsung", ignoreCase = true)
-        val magnitudeMicroA = when {
-            halUsesMicroAmps -> {
-                // Verified µA HAL: values < 9,500 µA (< 9.5 mA / < 0.04 W) are noise-floor
-                // trickle current; store 0L so BatterySampleEntity never confuses them with legacy mA rows.
-                if (absRaw < 9_500L) 0L else absRaw
-            }
-            absRaw > 9_500L -> absRaw
-            isSamsung -> absRaw * 1000L
-            else -> absRaw * 1000L
-        }
-        if (magnitudeMicroA == 0L) return 0L
-        return if (isCharging) magnitudeMicroA else -magnitudeMicroA
+        val isVerifiedLegacyMilliampHal = !halUsesMicroAmps &&
+            Build.MANUFACTURER.equals("samsung", ignoreCase = true) &&
+            Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+        return normalizeCurrentReadingToMicroAmps(
+            raw = raw,
+            isCharging = isCharging,
+            halUsesMicroAmps = halUsesMicroAmps,
+            isLegacyMilliampHal = isVerifiedLegacyMilliampHal
+        )
     }
 
     private data class NetworkHardwareState(
@@ -541,6 +535,27 @@ class BatteryHardwareReader(private val context: Context) {
     }
 
     companion object {
+        /**
+         * Pure conversion from raw Android BatteryManager current property to canonical signed µA.
+         * Standard Android HALs report µA directly (including small valid standby values such as
+         * 8,000 µA = 8 mA = 0.032 W at 4 V). Only verified legacy mA-reporting HALs scale by 1000x.
+         */
+        fun normalizeCurrentReadingToMicroAmps(
+            raw: Long,
+            isCharging: Boolean,
+            halUsesMicroAmps: Boolean,
+            isLegacyMilliampHal: Boolean = false
+        ): Long {
+            val absRaw = abs(raw)
+            if (absRaw == 0L) return 0L
+            val magnitudeMicroA = if (!halUsesMicroAmps && isLegacyMilliampHal && absRaw <= 9_500L) {
+                absRaw * 1000L
+            } else {
+                absRaw
+            }
+            return if (isCharging) magnitudeMicroA else -magnitudeMicroA
+        }
+
         fun mergeIntervalsDuration(intervals: List<Pair<Long, Long>>): Long {
             if (intervals.isEmpty()) return 0L
             val sorted = intervals.sortedBy { it.first }

@@ -114,6 +114,7 @@
     <string name="section_detected_spikes">Detected Drain Spikes — Tap to Inspect</string>
     <string name="overnight_morning_report_badge">Morning Report</string>
     <string name="overnight_before_plugged_in_badge">Before you plugged in</string>
+    <string name="overnight_recent_session_badge">Recent Session</string>
     <string name="overnight_awaiting_badge">Morning Report · Calibrating</string>
     <string name="action_replay_night">Replay Night</string>
     <string name="action_replay_window">Replay Window</string>

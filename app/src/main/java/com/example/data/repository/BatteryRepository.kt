@@ -131,6 +131,8 @@ class BatteryRepository(
         batteryDao.clearAllSamples()
         batteryDao.clearAllAppEvents()
         batteryDao.clearAllEnergyMeters()
+        preferences.setLastAppUsageCursorMs(0L)
+        DiagnosticReportGenerator.clearExportCache(context)
     }
 
     suspend fun setBackgroundMonitoring(enabled: Boolean) {
@@ -170,7 +172,7 @@ class BatteryRepository(
         preferences.clearWatchInvestigation()
     }
 
-    suspend fun recordWatchMatch(matchedAtMs: Long, summary: String) {
-        preferences.recordWatchMatch(matchedAtMs, summary)
+    suspend fun recordWatchMatch(matchedEventId: String, matchedAtMs: Long, summary: String) {
+        preferences.recordWatchMatch(matchedEventId, matchedAtMs, summary)
     }
 }

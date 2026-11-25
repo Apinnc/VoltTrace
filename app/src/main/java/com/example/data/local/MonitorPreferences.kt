@@ -28,6 +28,7 @@ data class UserMonitorSettings(
     val ratedCapacityMah: Int = 4500,
     val lastThermalAlertMs: Long = 0L,
     val lastStandbyAlertMs: Long = 0L,
+    val lastAppUsageCursorMs: Long = 0L,
     val watchConfig: WatchInvestigationConfig = WatchInvestigationConfig()
 )
 
@@ -42,6 +43,7 @@ class MonitorPreferences(private val context: Context) {
         val RATED_CAPACITY_MAH = intPreferencesKey("rated_capacity_mah")
         val LAST_THERMAL_ALERT_MS = longPreferencesKey("last_thermal_alert_ms")
         val LAST_STANDBY_ALERT_MS = longPreferencesKey("last_standby_alert_ms")
+        val LAST_APP_USAGE_CURSOR_MS = longPreferencesKey("last_app_usage_cursor_ms")
 
         // "Watch for this again" persistent investigation rule
         val WATCH_ACTIVE = booleanPreferencesKey("watch_investigation_active")
@@ -53,6 +55,7 @@ class MonitorPreferences(private val context: Context) {
         val WATCH_ARMED_AT_MS = longPreferencesKey("watch_investigation_armed_at_ms")
         val WATCH_MATCH_COUNT = intPreferencesKey("watch_investigation_match_count")
         val WATCH_LAST_MATCHED_MS = longPreferencesKey("watch_investigation_last_matched_ms")
+        val WATCH_LAST_MATCHED_EVENT_ID = stringPreferencesKey("watch_investigation_last_matched_event_id")
         val WATCH_LAST_MATCH_SUMMARY = stringPreferencesKey("watch_investigation_last_match_summary")
     }
 
@@ -69,6 +72,7 @@ class MonitorPreferences(private val context: Context) {
             armedAtMs = prefs[Keys.WATCH_ARMED_AT_MS] ?: 0L,
             matchCount = prefs[Keys.WATCH_MATCH_COUNT] ?: 0,
             lastMatchedAtMs = prefs[Keys.WATCH_LAST_MATCHED_MS] ?: 0L,
+            lastMatchedEventId = prefs[Keys.WATCH_LAST_MATCHED_EVENT_ID] ?: "",
             lastMatchSummary = prefs[Keys.WATCH_LAST_MATCH_SUMMARY] ?: ""
         )
         UserMonitorSettings(
@@ -80,6 +84,7 @@ class MonitorPreferences(private val context: Context) {
             ratedCapacityMah = prefs[Keys.RATED_CAPACITY_MAH] ?: 4500,
             lastThermalAlertMs = prefs[Keys.LAST_THERMAL_ALERT_MS] ?: 0L,
             lastStandbyAlertMs = prefs[Keys.LAST_STANDBY_ALERT_MS] ?: 0L,
+            lastAppUsageCursorMs = prefs[Keys.LAST_APP_USAGE_CURSOR_MS] ?: 0L,
             watchConfig = watch
         )
     }
@@ -116,6 +121,10 @@ class MonitorPreferences(private val context: Context) {
         context.voltTraceDataStore.edit { it[Keys.LAST_STANDBY_ALERT_MS] = timestampMs }
     }
 
+    suspend fun setLastAppUsageCursorMs(timestampMs: Long) {
+        context.voltTraceDataStore.edit { it[Keys.LAST_APP_USAGE_CURSOR_MS] = timestampMs }
+    }
+
     suspend fun armWatchInvestigation(config: WatchInvestigationConfig) {
         context.voltTraceDataStore.edit {
             it[Keys.WATCH_ACTIVE] = true
@@ -127,6 +136,7 @@ class MonitorPreferences(private val context: Context) {
             it[Keys.WATCH_ARMED_AT_MS] = config.armedAtMs
             it[Keys.WATCH_MATCH_COUNT] = config.matchCount
             it[Keys.WATCH_LAST_MATCHED_MS] = config.lastMatchedAtMs
+            it[Keys.WATCH_LAST_MATCHED_EVENT_ID] = config.lastMatchedEventId
             it[Keys.WATCH_LAST_MATCH_SUMMARY] = config.lastMatchSummary
         }
     }
@@ -139,17 +149,21 @@ class MonitorPreferences(private val context: Context) {
             it[Keys.WATCH_SUSPECT_PACKAGE] = ""
             it[Keys.WATCH_MATCH_COUNT] = 0
             it[Keys.WATCH_LAST_MATCHED_MS] = 0L
+            it[Keys.WATCH_LAST_MATCHED_EVENT_ID] = ""
             it[Keys.WATCH_LAST_MATCH_SUMMARY] = ""
         }
     }
 
-    suspend fun recordWatchMatch(matchedAtMs: Long, summary: String) {
+    suspend fun recordWatchMatch(matchedEventId: String, matchedAtMs: Long, summary: String) {
         context.voltTraceDataStore.edit {
             val prevCount = it[Keys.WATCH_MATCH_COUNT] ?: 0
             val prevTs = it[Keys.WATCH_LAST_MATCHED_MS] ?: 0L
-            if (matchedAtMs > prevTs) {
+            val prevId = it[Keys.WATCH_LAST_MATCHED_EVENT_ID] ?: ""
+            val isNewEvent = matchedEventId.isNotBlank() && matchedEventId != prevId && matchedAtMs > prevTs
+            if (isNewEvent) {
                 it[Keys.WATCH_MATCH_COUNT] = prevCount + 1
                 it[Keys.WATCH_LAST_MATCHED_MS] = matchedAtMs
+                it[Keys.WATCH_LAST_MATCHED_EVENT_ID] = matchedEventId
                 it[Keys.WATCH_LAST_MATCH_SUMMARY] = summary
             }
         }

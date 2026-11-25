@@ -369,16 +369,29 @@ private fun AppCulpritRow(
             }
 
             Column(horizontalAlignment = Alignment.End) {
-                Text(
-                    text = String.format(Locale.US, "%.1f%% total", app.shareOfTotalDrainPct),
-                    style = TelemetryTextStyles.MetricValue,
-                    color = accent
-                )
-                Text(
-                    text = String.format(Locale.US, "%.1f mAh · %.0f%% apps", app.estimatedMah, app.sharePct),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                if (app.hasEnergyEstimate) {
+                    Text(
+                        text = String.format(Locale.US, "%.1f%% total", app.shareOfTotalDrainPct),
+                        style = TelemetryTextStyles.MetricValue,
+                        color = accent
+                    )
+                    Text(
+                        text = String.format(Locale.US, "%.1f mAh · %.0f%% apps", app.estimatedMah, app.sharePct),
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else {
+                    Text(
+                        text = "Usage only",
+                        style = TelemetryTextStyles.MetricSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Text(
+                        text = "No drain recorded",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
         }
     }

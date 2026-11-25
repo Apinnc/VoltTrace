@@ -269,6 +269,144 @@ object RootCauseAnalyzer {
             }
         }
 
+        data class PendingDischargeInterval(
+            val a: BatterySampleEntity,
+            val b: BatterySampleEntity,
+            val dtMs: Long,
+            val dtHours: Float,
+            val avgV: Float,
+            val counterBacked: Boolean,
+            val rawMah: Float,
+            val rawWh: Float,
+            val rawPct: Float,
+            val measuredPowerMw: Float,
+            val effectivePowerMw: Float,
+            val hwEstimate: Map<HardwareComponentType, Float>,
+            val hwSumMw: Float,
+            val hasValidBootClocks: Boolean,
+            val intervalDeepSleepMs: Long,
+            val intervalCpuAwakeMs: Long
+        )
+
+        val pendingPeriod = mutableListOf<PendingDischargeInterval>()
+
+        fun flushDischargePeriod() {
+            if (pendingPeriod.isEmpty()) return
+
+            val isNonCounterPeriod = !pendingPeriod.first().counterBacked
+            val periodScale = if (isNonCounterPeriod) {
+                val periodStartPct = pendingPeriod.first().a.levelPct
+                val periodEndPct = pendingPeriod.last().b.levelPct
+                val periodGaugeDropPct = (periodStartPct - periodEndPct).coerceAtLeast(0).toFloat()
+                val periodRawPct = pendingPeriod.sumOf { it.rawPct.toDouble() }.toFloat()
+                if (periodGaugeDropPct > periodRawPct && periodRawPct > 0.0001f) {
+                    (periodGaugeDropPct / periodRawPct).coerceIn(1f, 25f)
+                } else {
+                    1f
+                }
+            } else {
+                1f
+            }
+
+            val periodTotalDtMs = pendingPeriod.sumOf { it.dtMs }.coerceAtLeast(1L)
+            val fallbackPeriodGaugeDropPct = if (isNonCounterPeriod) {
+                val periodRawPct = pendingPeriod.sumOf { it.rawPct.toDouble() }.toFloat()
+                val gaugeDrop = (pendingPeriod.first().a.levelPct - pendingPeriod.last().b.levelPct)
+                    .coerceAtLeast(0)
+                    .toFloat()
+                if (gaugeDrop > 0f && periodRawPct <= 0.0001f) gaugeDrop else 0f
+            } else {
+                0f
+            }
+
+            for (iv in pendingPeriod) {
+                val intervalMah = if (fallbackPeriodGaugeDropPct > 0f) {
+                    val shareDt = iv.dtMs.toFloat() / periodTotalDtMs.toFloat()
+                    ((fallbackPeriodGaugeDropPct * shareDt) / 100f) * ratedCapacityMah.coerceAtLeast(1000)
+                } else {
+                    iv.rawMah * periodScale
+                }
+                val intervalWh = (intervalMah * iv.avgV) / 1000f
+                val intervalPct = if (fallbackPeriodGaugeDropPct > 0f) {
+                    fallbackPeriodGaugeDropPct * (iv.dtMs.toFloat() / periodTotalDtMs.toFloat())
+                } else {
+                    iv.rawPct * periodScale
+                }
+                val effectivePowerMw = if (iv.measuredPowerMw > 25f) {
+                    iv.measuredPowerMw
+                } else {
+                    (intervalWh * 1000f / iv.dtHours).coerceIn(30f, 12_000f)
+                }
+
+                totalDischargedMah += intervalMah
+                totalDischargedPct += intervalPct
+                powerWeightedSum += effectivePowerMw * iv.dtHours
+                if (effectivePowerMw >= 3500f) spikeIntervalCount++
+
+                when {
+                    iv.a.isScreenOn && iv.b.isScreenOn -> {
+                        screenOnDischargeMs += iv.dtMs
+                        screenOnDischargedPct += intervalPct
+                    }
+                    !iv.a.isScreenOn && !iv.b.isScreenOn -> {
+                        screenOffDischargeMs += iv.dtMs
+                        screenOffDischargedPct += intervalPct
+                        if (iv.hasValidBootClocks) {
+                            totalDeepSleepMs += iv.intervalDeepSleepMs
+                            totalStandbyAwakeMs += iv.intervalCpuAwakeMs
+                        }
+                    }
+                    else -> {
+                        mixedTransitionDurationMs += iv.dtMs
+                    }
+                }
+
+                if (iv.a.wifiConnected && iv.b.wifiConnected) {
+                    wifiDischargeMs += iv.dtMs
+                    wifiDischargedPct += intervalPct
+                } else if (iv.a.cellularActive && iv.b.cellularActive) {
+                    cellularDischargeMs += iv.dtMs
+                    cellularDischargedPct += intervalPct
+                }
+
+                // Decompose interval energy across the 5 hardware subsystems + CPU/System residual
+                val maxHardwareBudgetMw = effectivePowerMw * 0.85f
+                val hwScale = if (iv.hwSumMw > maxHardwareBudgetMw && iv.hwSumMw > 0f) {
+                    maxHardwareBudgetMw / iv.hwSumMw
+                } else {
+                    1f
+                }
+
+                var assignedHwMah = 0f
+                var assignedHwWh = 0f
+                for ((comp, baseMw) in iv.hwEstimate) {
+                    if (baseMw <= 0f) continue
+                    val attributedMw = baseMw * hwScale
+                    val share = (attributedMw / effectivePowerMw.coerceAtLeast(1f)).coerceIn(0f, 0.85f)
+                    val compMah = intervalMah * share
+                    val compWh = intervalWh * share
+                    componentMah[comp] = (componentMah[comp] ?: 0f) + compMah
+                    componentWh[comp] = (componentWh[comp] ?: 0f) + compWh
+                    componentPowerTimeSum[comp] =
+                        (componentPowerTimeSum[comp] ?: 0f) + (attributedMw * iv.dtHours)
+                    assignedHwMah += compMah
+                    assignedHwWh += compWh
+                }
+
+                val cpuResidualMah = (intervalMah - assignedHwMah).coerceAtLeast(0f)
+                val cpuResidualWh = (intervalWh - assignedHwWh).coerceAtLeast(0f)
+                val cpuResidualMw = (effectivePowerMw - (iv.hwSumMw * hwScale)).coerceAtLeast(25f)
+                componentMah[HardwareComponentType.CPU_SYSTEM] =
+                    (componentMah[HardwareComponentType.CPU_SYSTEM] ?: 0f) + cpuResidualMah
+                componentWh[HardwareComponentType.CPU_SYSTEM] =
+                    (componentWh[HardwareComponentType.CPU_SYSTEM] ?: 0f) + cpuResidualWh
+                componentPowerTimeSum[HardwareComponentType.CPU_SYSTEM] =
+                    (componentPowerTimeSum[HardwareComponentType.CPU_SYSTEM] ?: 0f) + (cpuResidualMw * iv.dtHours)
+            }
+
+            pendingPeriod.clear()
+        }
+
         for (i in 0 until sorted.lastIndex) {
             val a = sorted[i]
             val b = sorted[i + 1]
@@ -276,6 +414,7 @@ object RootCauseAnalyzer {
             if (dtMs <= 0L) continue
             // Account for multi-hour device power-off / collector-stopped gaps (> 6h) explicitly
             if (dtMs > 6L * 60L * 60L * 1000L) {
+                flushDischargePeriod()
                 gapDurationMs += dtMs
                 continue
             }
@@ -324,6 +463,7 @@ object RootCauseAnalyzer {
 
             // Explicitly account for charging intervals and exclude them from discharge attribution
             if (a.isCharging || b.isCharging) {
+                flushDischargePeriod()
                 chargingDurationMs += dtMs
                 val chargedMah = when {
                     a.chargeCounterMicroAh > 0L && b.chargeCounterMicroAh > a.chargeCounterMicroAh -> {
@@ -351,9 +491,14 @@ object RootCauseAnalyzer {
             }
             val hwSumMw = hwEstimate.values.sum()
 
-            // Determine actual electrical energy consumed in this discharging interval
+            // Determine electrical energy consumed in this discharging interval;
+            // non-counter-backed intervals are reconciled against whole-number gauge drop ONCE per continuous period.
             val counterBacked = a.chargeCounterMicroAh > 0L && b.chargeCounterMicroAh > 0L
             if (counterBacked) counterBackedDischargeIntervals++
+            if (pendingPeriod.isNotEmpty() && pendingPeriod.first().counterBacked != counterBacked) {
+                flushDischargePeriod()
+            }
+
             val intervalMah = computeIntervalMah(
                 a = a,
                 b = b,
@@ -364,26 +509,14 @@ object RootCauseAnalyzer {
                 ratedCapacityMah = ratedCapacityMah
             )
             val intervalWh = (intervalMah * avgV) / 1000f
-            val intervalPct = if (counterBacked) {
-                (intervalMah / ratedCapacityMah.coerceAtLeast(1000)) * 100f
-            } else {
-                ((intervalMah / ratedCapacityMah.coerceAtLeast(1000)) * 100f)
-                    .coerceAtLeast((a.levelPct - b.levelPct).coerceAtLeast(0).toFloat())
-            }
+            val intervalPct = (intervalMah / ratedCapacityMah.coerceAtLeast(1000)) * 100f
             val effectivePowerMw = if (measuredPowerMw > 25f) {
                 measuredPowerMw
             } else {
                 (intervalWh * 1000f / dtHours).coerceIn(30f, 12_000f)
             }
 
-            totalDischargedMah += intervalMah
-            totalDischargedPct += intervalPct
-            powerWeightedSum += effectivePowerMw * dtHours
-            if (effectivePowerMw >= 3500f) spikeIntervalCount++
-
             // Track kernel deep sleep vs CPU awake across EVERY same-boot discharging interval
-            // (including coarse intervals whose endpoints happen to be screen-on, because the
-            // phone can still sleep deeply in the middle of a 15–60 min WORK interval).
             var intervalDeepSleepMs = 0L
             var intervalCpuAwakeMs = 0L
             var hasValidBootClocks = false
@@ -404,68 +537,28 @@ object RootCauseAnalyzer {
                 }
             }
 
-            // Strictly classify Pure Screen-On, Pure Screen-Off Standby, and Mixed Transitions
-            // so coarse screen-off -> screen-on intervals never inflate standby drain rates.
-            when {
-                a.isScreenOn && b.isScreenOn -> {
-                    screenOnDischargeMs += dtMs
-                    screenOnDischargedPct += intervalPct
-                }
-                !a.isScreenOn && !b.isScreenOn -> {
-                    screenOffDischargeMs += dtMs
-                    screenOffDischargedPct += intervalPct
-                    if (hasValidBootClocks) {
-                        totalDeepSleepMs += intervalDeepSleepMs
-                        totalStandbyAwakeMs += intervalCpuAwakeMs
-                    }
-                }
-                else -> {
-                    mixedTransitionDurationMs += dtMs
-                }
-            }
-
-            if (a.wifiConnected && b.wifiConnected) {
-                wifiDischargeMs += dtMs
-                wifiDischargedPct += intervalPct
-            } else if (a.cellularActive && b.cellularActive) {
-                cellularDischargeMs += dtMs
-                cellularDischargedPct += intervalPct
-            }
-
-            // Decompose interval energy across the 5 hardware subsystems + CPU/System residual
-            val maxHardwareBudgetMw = effectivePowerMw * 0.85f
-            val hwScale = if (hwSumMw > maxHardwareBudgetMw && hwSumMw > 0f) {
-                maxHardwareBudgetMw / hwSumMw
-            } else {
-                1f
-            }
-
-            var assignedHwMah = 0f
-            var assignedHwWh = 0f
-            for ((comp, baseMw) in hwEstimate) {
-                if (baseMw <= 0f) continue
-                val attributedMw = baseMw * hwScale
-                val share = (attributedMw / effectivePowerMw.coerceAtLeast(1f)).coerceIn(0f, 0.85f)
-                val compMah = intervalMah * share
-                val compWh = intervalWh * share
-                componentMah[comp] = (componentMah[comp] ?: 0f) + compMah
-                componentWh[comp] = (componentWh[comp] ?: 0f) + compWh
-                componentPowerTimeSum[comp] =
-                    (componentPowerTimeSum[comp] ?: 0f) + (attributedMw * dtHours)
-                assignedHwMah += compMah
-                assignedHwWh += compWh
-            }
-
-            val cpuResidualMah = (intervalMah - assignedHwMah).coerceAtLeast(0f)
-            val cpuResidualWh = (intervalWh - assignedHwWh).coerceAtLeast(0f)
-            val cpuResidualMw = (effectivePowerMw - (hwSumMw * hwScale)).coerceAtLeast(25f)
-            componentMah[HardwareComponentType.CPU_SYSTEM] =
-                (componentMah[HardwareComponentType.CPU_SYSTEM] ?: 0f) + cpuResidualMah
-            componentWh[HardwareComponentType.CPU_SYSTEM] =
-                (componentWh[HardwareComponentType.CPU_SYSTEM] ?: 0f) + cpuResidualWh
-            componentPowerTimeSum[HardwareComponentType.CPU_SYSTEM] =
-                (componentPowerTimeSum[HardwareComponentType.CPU_SYSTEM] ?: 0f) + (cpuResidualMw * dtHours)
+            pendingPeriod.add(
+                PendingDischargeInterval(
+                    a = a,
+                    b = b,
+                    dtMs = dtMs,
+                    dtHours = dtHours,
+                    avgV = avgV,
+                    counterBacked = counterBacked,
+                    rawMah = intervalMah,
+                    rawWh = intervalWh,
+                    rawPct = intervalPct,
+                    measuredPowerMw = measuredPowerMw,
+                    effectivePowerMw = effectivePowerMw,
+                    hwEstimate = hwEstimate,
+                    hwSumMw = hwSumMw,
+                    hasValidBootClocks = hasValidBootClocks,
+                    intervalDeepSleepMs = intervalDeepSleepMs,
+                    intervalCpuAwakeMs = intervalCpuAwakeMs
+                )
+            )
         }
+        flushDischargePeriod()
 
         val totalDischargeHours = (totalDischargeMs / 3_600_000f).coerceAtLeast(0.0001f)
         val hasRealDischarge = totalDischargeMs >= 10_000L && totalDischargedMah > 0.001f
@@ -622,12 +715,14 @@ object RootCauseAnalyzer {
             avgVoltageVolts = avgVoltageVolts
         )
         val hasMeasuredMeters = discoveredEnergyMeters.any { it.deltaMWh > 0.05f }
+        // Keep the 6-component hardwareBreakdown honestly labeled as modeled even when supplemental
+        // PowerMonitor readings exist (which are reported separately in discoveredEnergyMeters).
         val hardwareAttributionMode = if (hasMeasuredMeters) {
             val railCount = discoveredEnergyMeters.count { it.meterType == "MEASUREMENT" }
             val consumerCount = discoveredEnergyMeters.count { it.meterType == "CONSUMER" }
-            "Measured On-Device PowerMonitor ($railCount ODPM rails, $consumerCount consumers)"
+            "Modeled Component Split (Supplemental PowerMonitor Readings: $railCount ODPM rails, $consumerCount consumers)"
         } else {
-            "Modeled Estimate (0 Hardware Energy Meters Recorded in Window)"
+            "Modeled Component Split (0 Hardware Energy Meters Recorded in Window)"
         }
 
         val chargeCounterMeasured = totalDischargeIntervals > 0 &&
@@ -680,6 +775,7 @@ object RootCauseAnalyzer {
             mixedTransitionDurationMs = mixedTransitionDurationMs,
             gapDurationMs = gapDurationMs,
             totalChargedMah = totalChargedMah,
+            netChargeDeltaMah = totalChargedMah - totalDischargedMah,
             peakDischargePowerMw = peakDischargePowerMw,
             peakDischargePowerTimestampMs = peakDischargePowerTimestampMs,
             peakChargePowerMw = peakChargePowerMw,
@@ -774,15 +870,15 @@ object RootCauseAnalyzer {
 
             val (verdict, severity) = when {
                 deepSleepPct != null && ratePctHr >= 2.5f && deepSleepPct < 75f ->
-                    "CPU Wakelock Confirmed" to CauseSeverity.CRITICAL
+                    "High CPU Awake Time (Possible Wakelock)" to CauseSeverity.CRITICAL
                 ratePctHr >= 2.5f ->
                     "Severe Standby Drain" to CauseSeverity.CRITICAL
                 deepSleepPct != null && ratePctHr >= 1.3f && deepSleepPct < 75f ->
-                    "Partial Wakelocks Detected" to CauseSeverity.ELEVATED
+                    "Elevated CPU Awake Time (Possible Wakelock)" to CauseSeverity.ELEVATED
                 deepSleepPct != null && ratePctHr >= 1.3f && deepSleepPct >= 85f ->
-                    "Radio / Baseband Standby Drain" to CauseSeverity.ELEVATED
+                    "Standby Drain While Deep-Sleeping (Possible Radio/Baseband)" to CauseSeverity.ELEVATED
                 ratePctHr >= 1.3f ->
-                    "Wakelock Suspected" to CauseSeverity.ELEVATED
+                    "Elevated Standby Drain (Cause Unconfirmed)" to CauseSeverity.ELEVATED
                 else ->
                     "Deep Sleep Healthy" to CauseSeverity.HEALTHY
             }
@@ -905,13 +1001,9 @@ object RootCauseAnalyzer {
             if (integrated > 0.0005f) return integrated
         }
 
-        // Priority 3: Battery % drop scaled by calibrated capacity
-        val pctDrop = (a.levelPct - b.levelPct).coerceAtLeast(0)
-        if (pctDrop > 0) {
-            return (pctDrop / 100f) * ratedCapacityMah
-        }
-
-        // Priority 4: Hardware power-profile baseline integration over dt
+        // Priority 3: Hardware power-profile baseline integration over dt.
+        // Whole-number battery % gauge drops are reconciled once per continuous non-counter period
+        // in analyze() so coarse 1% steps are never double-counted with integrated current.
         return ((fallbackHwMw.coerceAtLeast(45f)) * dtHours) / avgVolts
     }
 
@@ -1417,14 +1509,35 @@ object RootCauseAnalyzer {
         }
 
         if (liveAppUsage.isNotEmpty()) {
+            // Do NOT invent energy attribution when no discharge has been recorded yet.
+            if (totalDischargedMah <= 0.5f) {
+                return liveAppUsage
+                    .sortedByDescending { it.foregroundMs }
+                    .take(10)
+                    .map { app ->
+                        AppDrainAttribution(
+                            packageName = app.packageName,
+                            appLabel = app.appLabel,
+                            totalForegroundMs = app.foregroundMs,
+                            wakeupCount = app.launchCount,
+                            estimatedMah = 0f,
+                            sharePct = 0f,
+                            shareOfTotalDrainPct = 0f,
+                            avgPowerMw = 0f,
+                            drainRatePctPerHour = 0f,
+                            isHighIntensity = false,
+                            hasEnergyEstimate = false
+                        )
+                    }
+            }
+
             val totalFgMs = liveAppUsage.sumOf { it.foregroundMs }.coerceAtLeast(1L)
-            val fallbackTotalMah = if (totalDischargedMah > 0.5f) totalDischargedMah else (ratedCapacityMah * 0.05f)
             return liveAppUsage.map { app ->
                 val share = app.foregroundMs.toFloat() / totalFgMs.toFloat()
-                val mah = fallbackTotalMah * share
+                val mah = totalDischargedMah * share
                 val hours = (app.foregroundMs / 3_600_000f).coerceAtLeast(0.01f)
                 val drainPctHr = ((mah / ratedCapacityMah.coerceAtLeast(1000)) * 100f) / hours
-                val totalShare = ((mah / fallbackTotalMah.coerceAtLeast(1f)) * 100f).coerceIn(0f, 100f)
+                val totalShare = ((mah / totalDischargedMah.coerceAtLeast(1f)) * 100f).coerceIn(0f, 100f)
                 AppDrainAttribution(
                     packageName = app.packageName,
                     appLabel = app.appLabel,
@@ -1435,7 +1548,8 @@ object RootCauseAnalyzer {
                     shareOfTotalDrainPct = totalShare,
                     avgPowerMw = avgPowerMw,
                     drainRatePctPerHour = drainPctHr.coerceIn(0f, 80f),
-                    isHighIntensity = app.launchCount >= 10 || totalShare >= 25f
+                    isHighIntensity = app.launchCount >= 10 || totalShare >= 25f,
+                    hasEnergyEstimate = true
                 )
             }.sortedByDescending { it.estimatedMah }.take(10)
         }
@@ -1497,7 +1611,7 @@ object RootCauseAnalyzer {
             )
         }
 
-        // 2. Screen-Off Wakelock / Deep-Sleep Prevention
+        // 2. Elevated Screen-Off Standby Drain / Observed CPU Awake Time
         if (screenOffDurationMs >= 5 * 60_000L && screenOffRatePctHr >= 1.5f) {
             val severity = if (screenOffRatePctHr >= 3.0f) CauseSeverity.CRITICAL else CauseSeverity.ELEVATED
             val clockTotal = totalDeepSleepMs + totalStandbyAwakeMs
@@ -1505,10 +1619,10 @@ object RootCauseAnalyzer {
                 id = "cause_wakelock",
                 category = RootCauseCategory.WAKELOCK_STANDBY,
                 severity = severity,
-                title = "Standby Wakelock / Doze Interruption",
+                title = "Elevated Screen-Off Standby Drain",
                 headlineMetric = String.format(Locale.US, "%.1f%%/hr off", screenOffRatePctHr),
                 sharePct = (byComp[HardwareComponentType.CPU_SYSTEM]?.sharePct ?: 25f),
-                explanation = "Battery continued draining during pure screen-off intervals, indicating background wakeups, active radios, or partial wakelocks limiting Android Doze deep sleep.",
+                explanation = "Battery continued draining during pure screen-off intervals. Observed CPU awake time and radio activity can point to background jobs, sync loops, or partial wakelocks limiting Android Doze deep sleep.",
                 evidencePoints = buildList {
                     add(String.format(Locale.US, "Pure standby rate: %.1f%%/hr (healthy baseline < 1.0%%/hr)", screenOffRatePctHr))
                     add("Observed across ${formatDuration(screenOffDurationMs)} of pure screen-off time (mixed transitions excluded)")
@@ -1677,9 +1791,13 @@ object RootCauseAnalyzer {
             )
         }
 
-        // 9. Top App Culprit (when Usage Access provides real attribution)
+        // 9. Top App Culprit (when Usage Access provides real attribution backed by measured loss)
         val topApp = appCulprits.firstOrNull()
-        if (topApp != null && (topApp.shareOfTotalDrainPct >= 10f || (topApp.sharePct >= 30f && topApp.estimatedMah >= 25f))) {
+        if (topApp != null &&
+            topApp.hasEnergyEstimate &&
+            topApp.estimatedMah > 0.5f &&
+            (topApp.shareOfTotalDrainPct >= 10f || (topApp.sharePct >= 30f && topApp.estimatedMah >= 25f))
+        ) {
             findings += RootCauseFinding(
                 id = "cause_app_${topApp.packageName}",
                 category = RootCauseCategory.APP_CULPRIT,
@@ -1753,7 +1871,7 @@ object RootCauseAnalyzer {
         val appCulprits = buildAppAttribution(
             appEvents = emptyList(),
             liveAppUsage = liveAppUsage,
-            totalDischargedMah = (ratedCapacityMah * 0.05f),
+            totalDischargedMah = 0f,
             avgPowerMw = sample?.powerMw?.coerceAtLeast(350f) ?: 450f,
             ratedCapacityMah = ratedCapacityMah
         )

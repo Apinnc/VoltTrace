@@ -209,6 +209,14 @@ private fun VoltTraceRoot(
         }
     }
 
+    // Tie 2-second live hardware polling strictly to the visible Activity lifecycle
+    LifecycleEventEffect(Lifecycle.Event.ON_START) {
+        viewModel.setForegroundActive(true)
+    }
+    LifecycleEventEffect(Lifecycle.Event.ON_STOP) {
+        viewModel.setForegroundActive(false)
+    }
+
     // Refresh Usage Access permission status & ensure Precision Service matches setting on resume
     LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
         viewModel.refreshUsageAccessAndApps()

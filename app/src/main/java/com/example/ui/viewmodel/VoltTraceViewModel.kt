@@ -30,7 +30,9 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
@@ -45,11 +47,14 @@ data class ProbeUiState(
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class VoltTraceViewModel(
-    private val repository: BatteryRepository
+    private val repository: BatteryRepository,
+    private val clockMs: () -> Long = { System.currentTimeMillis() }
 ) : ViewModel() {
 
     private val _selectedWindow = MutableStateFlow(AnalysisWindow.TWENTY_FOUR_HOURS)
     val selectedWindow: StateFlow<AnalysisWindow> = _selectedWindow.asStateFlow()
+
+    private val _windowClockTickMs = MutableStateFlow(clockMs())
 
     private val _liveSample = MutableStateFlow(repository.readLiveSample("INIT"))
     val liveSample: StateFlow<BatterySampleEntity> = _liveSample.asStateFlow()
@@ -87,8 +92,12 @@ class VoltTraceViewModel(
     private val _showOvernightReplaySheet = MutableStateFlow(false)
     val showOvernightReplaySheet: StateFlow<Boolean> = _showOvernightReplaySheet.asStateFlow()
 
+    private var livePollingJob: Job? = null
     private var probeJob: Job? = null
     private var spikeJob: Job? = null
+
+    val isLivePollingActive: Boolean
+        get() = livePollingJob?.isActive == true
 
     val settings: StateFlow<UserMonitorSettings> = repository.settingsFlow.stateIn(
         scope = viewModelScope,
@@ -102,12 +111,13 @@ class VoltTraceViewModel(
         initialValue = 0
     )
 
-    private val windowSinceMsFlow = _selectedWindow.combine(
-        MutableStateFlow(Unit)
-    ) { window, _ ->
+    internal val windowSinceMsFlow = combine(
+        _selectedWindow,
+        _windowClockTickMs
+    ) { window, nowMs ->
         val duration = window.durationMs
-        if (duration == null) 0L else (System.currentTimeMillis() - duration)
-    }
+        if (duration == null) 0L else (nowMs - duration).coerceAtLeast(0L)
+    }.distinctUntilChanged()
 
     val windowSamples: StateFlow<List<BatterySampleEntity>> = windowSinceMsFlow
         .flatMapLatest { sinceMs -> repository.observeSamplesSince(sinceMs) }
@@ -166,16 +176,20 @@ class VoltTraceViewModel(
         )
     )
 
-    private val baselineSamples: StateFlow<List<BatterySampleEntity>> = repository
-        .observeSamplesSince(System.currentTimeMillis() - 14L * 24L * 60L * 60L * 1000L)
+    private val baselineSamples: StateFlow<List<BatterySampleEntity>> = _windowClockTickMs
+        .map { nowMs -> (nowMs - 14L * 24L * 60L * 60L * 1000L).coerceAtLeast(0L) }
+        .distinctUntilChanged()
+        .flatMapLatest { sinceMs -> repository.observeSamplesSince(sinceMs) }
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5000),
             initialValue = emptyList()
         )
 
-    private val recentOvernightAppEvents = repository
-        .observeAppEventsSince(System.currentTimeMillis() - 48L * 60L * 60L * 1000L)
+    private val recentOvernightAppEvents = _windowClockTickMs
+        .map { nowMs -> (nowMs - 48L * 60L * 60L * 1000L).coerceAtLeast(0L) }
+        .distinctUntilChanged()
+        .flatMapLatest { sinceMs -> repository.observeAppEventsSince(sinceMs) }
         .stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5000),
@@ -193,12 +207,17 @@ class VoltTraceViewModel(
             watchConfig = userSettings.watchConfig,
             ratedCapacityMah = userSettings.ratedCapacityMah
         )
+        val matchEventId = report.watchMatchEventId
+        val matchEventTs = report.watchMatchEventTimestampMs
         if (report.watchTriggeredThisWindow &&
-            report.windowEndMs > userSettings.watchConfig.lastMatchedAtMs &&
+            matchEventId != null &&
+            matchEventTs != null &&
+            matchEventId != userSettings.watchConfig.lastMatchedEventId &&
+            matchEventTs > userSettings.watchConfig.armedAtMs &&
             !report.watchMatchReason.isNullOrBlank()
         ) {
             viewModelScope.launch {
-                repository.recordWatchMatch(report.windowEndMs, report.watchMatchReason)
+                repository.recordWatchMatch(matchEventId, matchEventTs, report.watchMatchReason)
             }
         }
         report
@@ -215,30 +234,55 @@ class VoltTraceViewModel(
             refreshUsageAccessAndApps()
             scanEnergyMeters(showToast = false)
         }
-        startLiveTelemetryLoop()
     }
 
-    private fun startLiveTelemetryLoop() {
-        viewModelScope.launch {
-            var ticks = 0
-            while (isActive) {
-                delay(2_000L)
-                ticks++
-                val sample = repository.readLiveSample("LIVE")
-                _liveSample.value = sample
-                _liveSubsystems.value = RootCauseAnalyzer.estimateLiveSubsystems(sample)
-                val traceMw = effectiveOscilloscopeMw(sample)
-                _oscilloscopeMw.update { current ->
-                    (current + traceMw).takeLast(48)
-                }
-                // Persist meaningful longitudinal transitions or every 60 seconds while open
-                if (ticks % 30 == 0) {
-                    repository.recordSampleIfSignificant(sample, minIntervalMs = 55_000L)
-                } else {
-                    repository.recordSampleIfSignificant(sample, minIntervalMs = 180_000L)
+    /**
+     * Ties the 2-second live hardware polling loop strictly to the visible Activity lifecycle
+     * (ON_START / ON_STOP) so VoltTrace performs zero background polling when left closed
+     * unless the user explicitly enabled WorkManager or the 1-min Precision Monitor.
+     */
+    fun setForegroundActive(active: Boolean) {
+        if (active) {
+            advanceWindowClock()
+            if (livePollingJob?.isActive == true) return
+            livePollingJob = viewModelScope.launch {
+                var ticks = 0
+                while (isActive) {
+                    delay(2_000L)
+                    ticks++
+                    val sample = repository.readLiveSample("LIVE")
+                    _liveSample.value = sample
+                    _liveSubsystems.value = RootCauseAnalyzer.estimateLiveSubsystems(sample)
+                    val traceMw = effectiveOscilloscopeMw(sample)
+                    _oscilloscopeMw.update { current ->
+                        (current + traceMw).takeLast(48)
+                    }
+                    // Roll time-window queries forward every 30s while the app stays open
+                    if (ticks % 15 == 0) {
+                        advanceWindowClock()
+                    }
+                    // Persist meaningful longitudinal transitions or every 60 seconds while open
+                    if (ticks % 30 == 0) {
+                        repository.recordSampleIfSignificant(sample, minIntervalMs = 55_000L)
+                    } else {
+                        repository.recordSampleIfSignificant(sample, minIntervalMs = 180_000L)
+                    }
                 }
             }
+        } else {
+            livePollingJob?.cancel()
+            livePollingJob = null
         }
+    }
+
+    fun advanceWindowClock(nowMs: Long = clockMs()) {
+        _windowClockTickMs.value = nowMs
+    }
+
+    override fun onCleared() {
+        livePollingJob?.cancel()
+        livePollingJob = null
+        super.onCleared()
     }
 
     private fun effectiveOscilloscopeMw(sample: BatterySampleEntity): Float {
@@ -251,6 +295,7 @@ class VoltTraceViewModel(
 
     fun selectWindow(window: AnalysisWindow) {
         _selectedWindow.value = window
+        advanceWindowClock()
         refreshUsageAccessAndApps()
     }
 

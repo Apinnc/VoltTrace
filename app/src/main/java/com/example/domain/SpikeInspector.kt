@@ -251,16 +251,35 @@ object SpikeInspector {
 
         val liveHardware = RootCauseAnalyzer.estimateLiveSubsystems(target)
 
-        // Filter persisted Room AppDrainEvent rows overlapping the spike window
+        // Strictly intersect persisted Room AppDrainEvent intervals [start, end] with [windowStartMs, windowEndMs]
+        val directAppPackages = appUsage.map { it.packageName }.toSet()
         val overlappingPersistedApps = appDrainEvents
-            .filter { it.timestampMs in (windowStartMs - 15L * 60_000L)..(windowEndMs + 15L * 60_000L) }
-            .groupBy { it.packageName }
+            .mapNotNull { ev ->
+                val evEnd = ev.timestampMs
+                val evDuration = ev.intervalDurationMs.coerceAtLeast(1L)
+                val evStart = evEnd - evDuration
+                val overlapStart = max(evStart, windowStartMs)
+                val overlapEnd = minOf(evEnd, windowEndMs)
+                val overlapMs = overlapEnd - overlapStart
+                if (overlapMs <= 0L) return@mapNotNull null
+
+                val proratedFgMs = if (ev.foregroundMs > 0L) {
+                    ((ev.foregroundMs.toDouble() * overlapMs.toDouble()) / evDuration.toDouble())
+                        .toLong()
+                        .coerceIn(1L, overlapMs)
+                } else {
+                    0L
+                }
+                if (proratedFgMs <= 0L) return@mapNotNull null
+                ev to proratedFgMs
+            }
+            .groupBy { (ev, _) -> ev.packageName }
             .map { (pkg, rows) ->
                 ObservedAppUsage(
                     packageName = pkg,
-                    appLabel = rows.last().appLabel,
-                    foregroundMs = rows.sumOf { it.foregroundMs },
-                    launchCount = rows.sumOf { it.launchCount }.coerceAtLeast(1)
+                    appLabel = rows.last().first.appLabel,
+                    foregroundMs = rows.sumOf { (_, fgMs) -> fgMs },
+                    launchCount = rows.sumOf { (ev, _) -> ev.launchCount }.coerceAtLeast(1)
                 )
             }
         val mergedApps = (appUsage + overlappingPersistedApps)
@@ -275,6 +294,10 @@ object SpikeInspector {
             }
             .sortedByDescending { it.foregroundMs }
             .take(8)
+        val persistedOnlyPackages = overlappingPersistedApps
+            .map { it.packageName }
+            .filterNot { it in directAppPackages }
+            .toSet()
 
         // Summarize any PowerMonitor energy meters bracketing this spike
         val bracketingMeters = energyMeters.filter {
@@ -300,7 +323,11 @@ object SpikeInspector {
                     add("Foreground app recorded at this sample: $fgAppAtBoundary.")
                 } else if (mergedApps.isNotEmpty()) {
                     val top = mergedApps.first()
-                    add("Most active app in surrounding window: ${top.appLabel} (${RootCauseAnalyzer.formatDuration(top.foregroundMs)}).")
+                    if (top.packageName in persistedOnlyPackages) {
+                        add("Coarse overlapping interval logged: ${top.appLabel} (${RootCauseAnalyzer.formatDuration(top.foregroundMs)} overlapping; exact in-window timing unverified).")
+                    } else {
+                        add("Most active app in surrounding window: ${top.appLabel} (${RootCauseAnalyzer.formatDuration(top.foregroundMs)}).")
+                    }
                 }
                 if (clocksBefore != null && clocksBefore.awakePct >= 75f && !target.isScreenOn) {
                     add(

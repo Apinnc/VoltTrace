@@ -41,9 +41,26 @@ object DiagnosticReportGenerator {
         sb.appendLine("- **Efficiency Score**: ${report.efficiencyScore}/100")
         val chargeSourceTag = if (report.chargeCounterMeasured) "Hardware Battery Counter" else "Estimated"
         sb.appendLine(
-            "- **Net Charge Loss**: ${String.format(Locale.US, "%.1f mAh", report.totalDischargedMah)} " +
-                "($chargeSourceTag) | Overall Rate: ${String.format(Locale.US, "%.2f%%/hr", report.overallDrainRatePctPerHour)}"
+            "- **Total Discharged**: ${String.format(Locale.US, "%.1f mAh", report.totalDischargedMah)} " +
+                "($chargeSourceTag) | Overall Discharge Rate: ${String.format(Locale.US, "%.2f%%/hr", report.overallDrainRatePctPerHour)}"
         )
+        if (report.totalChargedMah > 0.05f || report.chargingDurationMs > 0L) {
+            sb.appendLine(
+                "- **Total Charged**: +${String.format(Locale.US, "%.1f mAh", report.totalChargedMah)} " +
+                    "across ${RootCauseAnalyzer.formatDuration(report.chargingDurationMs)}"
+            )
+            val netDelta = report.netChargeDeltaMah
+            val netFormatted = if (netDelta >= 0f) {
+                String.format(Locale.US, "+%.1f mAh (net gained)", netDelta)
+            } else {
+                String.format(Locale.US, "%.1f mAh (net lost)", netDelta)
+            }
+            sb.appendLine("- **Net Charge Change**: $netFormatted")
+        } else {
+            sb.appendLine(
+                "- **Net Charge Change**: ${String.format(Locale.US, "-%.1f mAh (discharge only)", report.totalDischargedMah)}"
+            )
+        }
         sb.appendLine("- **Pure Screen-On Drain**: ${String.format(Locale.US, "%.2f%%/hr", report.screenOnDrainRatePctPerHour)} across ${RootCauseAnalyzer.formatDuration(report.screenOnDurationMs)}")
         sb.appendLine("- **Pure Standby (Screen-Off) Drain**: ${String.format(Locale.US, "%.2f%%/hr", report.screenOffDrainRatePctPerHour)} across ${RootCauseAnalyzer.formatDuration(report.screenOffDurationMs)}")
         val budgetParts = buildList {
@@ -162,7 +179,8 @@ object DiagnosticReportGenerator {
             }
         }
 
-        sb.appendLine("## 4. Hardware Component Attribution (${report.hardwareAttributionMode})")
+        sb.appendLine("## 4. Modeled Hardware Component Breakdown")
+        sb.appendLine("_${report.hardwareAttributionMode}. Per-component figures below are modeled power-profile estimates bounded by battery discharge, separate from any hardware meter readings in Section 2._")
         sb.appendLine("| Component | Share | Attributed mAh | Avg Active Power | Duty | Verdict |")
         sb.appendLine("|---|---:|---:|---:|---:|---|")
         report.hardwareBreakdown.forEach { hw ->
@@ -209,13 +227,21 @@ object DiagnosticReportGenerator {
             sb.appendLine("| App | % of Total Drain | % of App Pool | Est. mAh | Active Time | Sessions | Intensity |")
             sb.appendLine("|---|---:|---:|---:|---:|---:|---:|")
             report.appCulprits.forEach { app ->
-                sb.appendLine(
-                    "| ${app.appLabel} | ${String.format(Locale.US, "%.1f%%", app.shareOfTotalDrainPct)} | " +
-                        "${String.format(Locale.US, "%.1f%%", app.sharePct)} | " +
-                        "${String.format(Locale.US, "%.1f", app.estimatedMah)} | " +
-                        "${RootCauseAnalyzer.formatDuration(app.totalForegroundMs)} | " +
-                        "${app.wakeupCount} | ${String.format(Locale.US, "%.1f%%/hr", app.drainRatePctPerHour)} |"
-                )
+                if (app.hasEnergyEstimate) {
+                    sb.appendLine(
+                        "| ${app.appLabel} | ${String.format(Locale.US, "%.1f%%", app.shareOfTotalDrainPct)} | " +
+                            "${String.format(Locale.US, "%.1f%%", app.sharePct)} | " +
+                            "${String.format(Locale.US, "%.1f", app.estimatedMah)} | " +
+                            "${RootCauseAnalyzer.formatDuration(app.totalForegroundMs)} | " +
+                            "${app.wakeupCount} | ${String.format(Locale.US, "%.1f%%/hr", app.drainRatePctPerHour)} |"
+                    )
+                } else {
+                    sb.appendLine(
+                        "| ${app.appLabel} | — | — | — | " +
+                            "${RootCauseAnalyzer.formatDuration(app.totalForegroundMs)} | " +
+                            "${app.wakeupCount} | Usage only |"
+                    )
+                }
             }
         }
 
@@ -294,5 +320,18 @@ object DiagnosticReportGenerator {
             "${context.packageName}.fileprovider",
             file
         )
+    }
+
+    /**
+     * Deletes any cached Markdown/CSV forensic reports written for sharing so clearing
+     * telemetry history leaves no residual exported files on disk.
+     */
+    fun clearExportCache(context: Context) {
+        val dir = File(context.cacheDir, "reports")
+        if (dir.exists() && dir.isDirectory) {
+            dir.listFiles()?.forEach { file ->
+                runCatching { file.delete() }
+            }
+        }
     }
 }
