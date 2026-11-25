@@ -166,21 +166,32 @@ fun OvernightMorningReportCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             } else {
-                // Mode clarity subtitle (only claim plug-in when an observed plug-in occurred)
+                // Mode clarity subtitle (only claim overnight charging when overnight charging was observed)
                 if (isPrePlugFallback) {
                     val pluggedClock = report.pluggedInAtMs?.let { OvernightReplayEngine.formatClock(it) }
-                    Text(
-                        text = if (pluggedClock != null) {
+                    val fallbackText = report.fallbackExplanation ?: when {
+                        report.chargedOvernight && pluggedClock != null ->
                             "Phone charged overnight (plugged in at $pluggedClock) — showing your last unplugged stretch before plugging in."
-                        } else {
+                        report.chargedOvernight ->
                             "Phone charged overnight — showing your most recent unplugged stretch."
-                        },
+                        report.connectedIdleOvernight && pluggedClock != null ->
+                            "Connected to external power at $pluggedClock with charging paused/idle — showing your last unplugged stretch before connecting."
+                        report.connectedIdleOvernight ->
+                            "Connected to external power with charging paused/idle — showing your last unplugged stretch before connecting."
+                        pluggedClock != null ->
+                            "Plugged in at $pluggedClock — showing your last unplugged stretch before plugging in."
+                        else ->
+                            "Showing your last unplugged stretch before plugging in."
+                    }
+                    Text(
+                        text = fallbackText,
                         style = MaterialTheme.typography.bodySmall,
                         color = telemetry.charging
                     )
                 } else if (isRecentSession) {
                     Text(
-                        text = "No full overnight standby window recorded yet — showing your most recent unplugged stretch.",
+                        text = report.fallbackExplanation
+                            ?: "No full overnight standby window recorded yet — showing your most recent unplugged stretch.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

@@ -375,8 +375,9 @@ private fun AppCulpritRow(
                         style = TelemetryTextStyles.MetricValue,
                         color = accent
                     )
+                    val methodTag = if (app.isUniformTimeEstimate) "uniform time est." else String.format(Locale.US, "%.0f%% apps", app.sharePct)
                     Text(
-                        text = String.format(Locale.US, "%.1f mAh · %.0f%% apps", app.estimatedMah, app.sharePct),
+                        text = String.format(Locale.US, "%.1f mAh · %s", app.estimatedMah, methodTag),
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )

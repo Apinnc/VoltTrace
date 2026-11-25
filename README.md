@@ -14,10 +14,10 @@ All analysis runs strictly on-device with **ordinary Android permissions** — n
 
 Most Android battery monitors either repackage Android's coarse `%` estimates or drain the battery themselves while polling. VoltTrace is built around forensic rigor:
 
-- **Counter-measured charge loss & true deep sleep:** Rather than guessing from 1% steps, VoltTrace measures net charge loss directly from Android's `BATTERY_PROPERTY_CHARGE_COUNTER` (`µAh`) and calculates real kernel deep sleep by comparing `SystemClock.elapsedRealtime()` against `SystemClock.uptimeMillis()` between samples.
-- **Explicit separation of evidence vs. unknowns:** Every drain episode, spike drill-down, and overnight summary shows what the hardware and OS actually recorded (timestamps, current, voltage, temperature, screen/radio state, and Usage Events) alongside an explicit **"What Remains Unknown"** section for data Android withholds from ordinary apps (such as named kernel wakelocks).
-- **Signed power direction & OEM current normalization:** Automatically normalizes OEM-specific microamp (`µA`) vs. milliamp (`mA`) battery current reporting and tracks signed power direction so charging peaks and discharge peaks are never conflated.
-- **Event-reconstructed app windows:** Instead of relying on Android's coarse aggregate usage buckets (which can over-report app time beyond the selected window), VoltTrace reconstructs foreground and background sessions from timestamped `UsageEvents`, clips them strictly to the analysis window, and merges overlapping intervals.
+- **Counter-measured charge loss & true deep sleep:** Rather than guessing from 1% steps, VoltTrace measures signed charge change directly from Android's `BATTERY_PROPERTY_CHARGE_COUNTER` (`µAh`) — including across plug and unplug transitions — and calculates real kernel deep sleep by comparing `SystemClock.elapsedRealtime()` against `SystemClock.uptimeMillis()` between samples.
+- **Explicit separation of evidence vs. unknowns:** Every drain episode, spike drill-down, and overnight summary shows what the hardware and OS actually recorded (timestamps, current, voltage, temperature, screen/radio state, and Usage Events), tags charge provenance explicitly as `Counter-measured`, `Mixed`, or `Estimated`, and includes a **"What Remains Unknown"** section for data Android withholds from ordinary apps (such as named kernel wakelocks or exact plug-in instants inside a transition interval).
+- **Signed power direction & verified current units:** Preserves Android's signed microamp (`µA`) current direction independently of plug connection or OS charging status (distinguishing cable connection, charging state, and net current flow), and flags unverified pre-v8 legacy rows as uncertain so they never distort peaks or alerts.
+- **Event-reconstructed & coverage-scaled app windows:** Instead of dumping an entire window's battery loss onto a briefly opened app, VoltTrace reconstructs foreground and background sessions from timestamped `UsageEvents`, clips them strictly to the analysis window, intersects them against confirmed discharging sub-intervals, and scales no-stored-event estimates by actual foreground time coverage (`Uniform time est.`).
 - **Automatic hardware energy-meter discovery (Android 15+):** Discovers and samples whatever `PowerMonitor` hardware rails the device actually exposes, safely filtering out counter resets across reboots.
 - **Built to let the phone sleep naturally:** Uses low-overhead 15-minute `WorkManager` sampling by default, with an opt-in 1-minute foreground monitor for high-resolution sessions — designed to avoid holding partial wake locks that distort standby measurements.
 - **100% local & private by design:** VoltTrace declares **no `INTERNET` permission**, sets `android:allowBackup="false"` with explicit backup/device-transfer exclusions for its Room database, DataStore preferences, and shared preferences, and clears cached export files whenever you reset telemetry history.
@@ -27,11 +27,11 @@ Most Android battery monitors either repackage Android's coarse `%` estimates or
 ## Key Features
 
 ### 1. Overnight Replay & 10-Second Morning Report (`Live` tab)
-- **Morning Report Card:** Appears at the top of the `Live` tab with total overnight loss (`-%` and `-mAh`, labeled `Counter-measured` or `Estimated`), deep-sleep percentage, a **Which Part Mattered Most** burst highlight with sparkline, and plain-English **What Your Phone Recorded** bullets.
+- **Morning Report Card:** Appears at the top of the `Live` tab with total overnight loss (`-%` and `-mAh`, labeled `Counter-measured`, `Mixed`, or `Estimated`), deep-sleep percentage, a **Which Part Mattered Most** burst highlight with sparkline, and plain-English **What Your Phone Recorded** bullets.
 - **Rolling 14-Day Personal Baseline:** Compares last night against your phone's own median overnight drain rate (`%/hr`), `mAh` loss, and deep-sleep ratio across prior nights.
 - **One-Tap Replay:** Opens an interactive overnight playback sheet with Play/Pause, scrubbing, **Key Peak** jump, shaded key-window band, tappable night breakdown chapters, verbatim source readings, and one-tap jump into spike drill-down.
-- **"Before you plugged in" Fallback:** If your phone charged overnight (or had no 2+ hour unplugged overnight standby stretch), VoltTrace automatically pivots to analyze the last meaningful unplugged stretch right before you plugged in.
-- **"Watch for this again" Investigation:** Arm a persistent watch rule on any suspicious overnight window and drain threshold. On subsequent nights only, VoltTrace evaluates the pattern in the background, flags matches in the Morning Report, and posts a **Watch Matched** notification.
+- **"Before you plugged in" Fallback:** If your phone charged overnight, VoltTrace automatically selects the unplugged stretch preceding that overnight charge (even after a short morning unplugged use) and distinguishes overnight charging from daytime/noon plug-ins or USB connected-idle sessions.
+- **"Watch for this again" Investigation:** Arm a persistent watch rule on any suspicious overnight window and drain threshold. On subsequent nights only, VoltTrace evaluates real post-arm sensor readings in the background, tracks matched and notified state separately, flags matches in the Morning Report, and posts a **Watch Matched** notification.
 
 ### 2. Live Telemetry Oscilloscope & 30-Second Drain Probe (`Live` tab)
 - Real-time 2-second hardware wattage, current (`mA`), voltage (`V`), temperature (`°C`), display brightness/refresh rate, radio transport, and thermal status.
@@ -40,11 +40,11 @@ Most Android battery monitors either repackage Android's coarse `%` estimates or
 ### 3. True Root-Cause Attribution (`Causes` tab)
 - Evidence-backed breakdown across display, cellular/Wi-Fi radios, standby wakeups, thermal load, and correlated apps.
 - Pure screen-off **Sleep & Standby Forensics** (automatically suppressing noisy `< 5 min` screen-off snippets and mixed screen transitions).
-- Traceable drain episodes linked directly back to their underlying source readings.
+- Traceable drain episodes reconciled with summary totals and linked directly back to their underlying source readings.
 
 ### 4. Interactive Power Timeline & Spike Drill-Down (`Timeline` tab)
 - Switchable **Power (W)**, **Temp (°C)**, and **Voltage (V)** charts overlaid with battery percentage and screen-on bands across `1H`, `6H`, `24H`, `7D`, and `All` windows.
-- Automatic detection of drain spikes — tap any spike or scrubber point to open the **Spike Drill-Down Sheet** showing surrounding samples, electrical/thermal deltas, deep-sleep interruption, and correlated app/service activity around that exact timestamp.
+- Automatic detection of drain spikes — tap any spike or scrubber point to open the **Spike Drill-Down Sheet** showing surrounding samples, per-side charge provenance (`before` vs. `after`), electrical/thermal deltas, deep-sleep interruption, hardware `PowerMonitor` deltas for that spike's timestamps, and correlated app/service activity strictly within the displayed evidence window.
 
 ### 5. Cell Inspector, Exports & Widget (`Inspector` tab)
 - Full battery hardware profile, discovered `PowerMonitor` rails, background collector controls, and critical thermal/standby drain alert toggles.
@@ -75,8 +75,8 @@ Most Android battery monitors either repackage Android's coarse `%` estimates or
 │ 3. Pure-Kotlin Forensic Engines (domain)                                │
 │    • OvernightReplayEngine: Morning Report, 14-day baseline, fallback,  │
 │      key-window isolation, and post-arm Watch recurrence matching       │
-│    • RootCauseAnalyzer: counter-based mAh loss, deep-sleep audit,       │
-│      clipped/merged app sessions, and hardware subsystem attribution    │
+│    • RootCauseAnalyzer: signed counter/transition mAh, deep-sleep audit,│
+│      coverage-scaled app sessions, and hardware subsystem attribution   │
 │    • SpikeInspector: spike detection & timestamped root-cause drilldown │
 │    • DiagnosticReportGenerator & CsvTelemetryParser: MD/CSV export &    │
 │      deterministic CSV replay for regression testing                    │
@@ -124,7 +124,7 @@ VoltTrace uses only standard, least-privilege Android permissions:
 
 ### Requirements
 - Android Studio or a system **Gradle** installation (JDK 11+, Android SDK with `compileSdk 36`, `minSdk 24`).
-- On a fresh Git checkout outside AI Studio, decode the checked-in debug keystore once before building:
+- On a fresh Git checkout outside AI Studio, decode the checked-in debug keystore once before building (the app's `build.gradle.kts` references `rootProject.file("debug.keystore")` for consistent debug/release signing across container builds):
 ```bash
 base64 -d debug.keystore.base64 > debug.keystore
 ```
@@ -140,8 +140,8 @@ gradle :app:testDebugUnitTest
 ```
 
 The test suite runs entirely on the local JVM (no emulator required) using synthetic multi-night and discharge CSV fixtures to verify:
-- Morning Report local-night clipping, multi-night splitting, rolling personal baseline, and key-window detection (`OvernightReplayEngineTest`, `CodeReviewRegressionTest`)
-- `"Before you plugged in"` vs. neutral `"Recent Session"` fallback, mixed counter/SOC evidence labeling, and post-arm `"Watch for this again"` deduplication (`OvernightReplayEngineTest`, `CodeReviewRegressionTest`)
+- Morning Report local-night clipping, multi-night splitting, target-night selection across overnight charging, boundary-interpolation isolation, and key-window detection (`OvernightReplayEngineTest`, `CodeReviewRegressionTest`, `V8BugRepairRegressionTest`)
+- `"Before you plugged in"` vs. daytime/noon plug-ins vs. USB connected-idle sessions vs. neutral `"Recent Session"` fallback, mixed counter/SOC evidence labeling, and post-arm `"Watch for this again"` match/notification deduplication across execution orders (`OvernightReplayEngineTest`, `CodeReviewRegressionTest`, `V8BugRepairRegressionTest`)
 - 10-second Morning Report Compose UI readability and actions (`OvernightMorningReportUiTest`)
-- Canonical microamp low-current handling, period-level non-counter discharge reconciliation, honest cause & modeled-vs-measured attribution labels, spike interval intersection, signed net-charge export math, and timestamp-proportional charts (`CsvReplayRegressionTest`, `RootCauseAnalyzerTest`, `CodeReviewRegressionTest`)
-- Backup-exclusion rules, export cache cleanup on history reset, lifecycle-gated live polling, and rolling 1H window cutoffs (`PrivacyAndLifecycleRegressionTest`)
+- Signed plug/unplug transition accounting, signed microamp preservation while `CHARGING`/`FULL`, legacy pre-v8 uncertain-unit handling, time-coverage-scaled app attribution, sub-interval worker discharge attribution, reconciled episode detection, and consistent spike drill-down evidence windows (`V8BugRepairRegressionTest`, `CsvReplayRegressionTest`, `RootCauseAnalyzerTest`, `CodeReviewRegressionTest`)
+- Backup-exclusion rules, export cache cleanup on history reset, lifecycle-gated live polling, and rolling 1H window cutoffs (`PrivacyAndLifecycleRegressionTest`, `V8BugRepairRegressionTest`)

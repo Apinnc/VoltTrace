@@ -179,6 +179,13 @@ fun OvernightReplayBottomSheet(
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    if (!report.fallbackExplanation.isNullOrBlank()) {
+                        Text(
+                            text = report.fallbackExplanation,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (isPrePlugFallback) telemetry.charging else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
 
                 Column(horizontalAlignment = Alignment.End) {

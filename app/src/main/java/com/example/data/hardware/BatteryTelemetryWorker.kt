@@ -55,25 +55,33 @@ class BatteryTelemetryWorker(
                         startMs = usageStartMs,
                         endMs = current.timestampMs
                     )
-                    prefs.setLastAppUsageCursorMs(current.timestampMs)
-
-                    if (observedApps.isNotEmpty() && !current.isCharging) {
-                        val windowSamples = recentSamples.filter {
-                            it.timestampMs in usageStartMs..current.timestampMs
-                        }
+                    if (observedApps.isNotEmpty()) {
+                        val windowSamples = dao.getSamplesInRange(usageStartMs, current.timestampMs)
+                            .ifEmpty {
+                                recentSamples.filter { it.timestampMs in usageStartMs..current.timestampMs }
+                            }
+                        val anchorBefore = dao.getLatestSampleAtOrBefore(usageStartMs) ?: previous
                         val events = computeAppDrainEvents(
                             observedApps = observedApps,
                             windowStartMs = usageStartMs,
                             windowEndMs = current.timestampMs,
                             samplesInWindow = windowSamples,
-                            fallbackPrevSample = previous,
+                            fallbackPrevSample = anchorBefore,
                             currentSample = current,
                             ratedCapacityMah = settings.ratedCapacityMah
                         )
                         if (events.isNotEmpty()) {
+                            events
+                                .map { it.timestampMs to it.intervalDurationMs }
+                                .distinct()
+                                .forEach { (evEndMs, evDurMs) ->
+                                    dao.deleteAppEventsForWindow(evEndMs, evDurMs)
+                                }
                             dao.insertAppEvents(events)
                         }
                     }
+                    // Advance cursor ONLY after sample and app-drain database writes succeed.
+                    prefs.setLastAppUsageCursorMs(current.timestampMs)
                 } else {
                     prefs.setLastAppUsageCursorMs(current.timestampMs)
                 }
@@ -167,10 +175,22 @@ class BatteryTelemetryWorker(
             }
         }
 
+        private data class SubIntervalInfo(
+            val startMs: Long,
+            val endMs: Long,
+            val durationMs: Long,
+            val isConfirmedDischarge: Boolean,
+            val dischargeMah: Float,
+            val avgPowerMw: Float
+        )
+
         /**
-         * Attributes only the foreground-covered fraction of an interval's battery discharge to
-         * observed foreground apps so idle/screen-off drain remains unassigned rather than being
-         * dumped onto a briefly used app.
+         * Attributes only the foreground-covered fraction of confirmed discharging sub-intervals'
+         * battery loss to apps active during those discharging sub-intervals.
+         *
+         * - Preserves discharge attribution from discharging sub-intervals that occurred before a plug-in,
+         *   even when [currentSample] is already charging.
+         * - Excludes app usage that occurred during charging or plug-transition sub-intervals.
          */
         fun computeAppDrainEvents(
             observedApps: List<ObservedAppUsage>,
@@ -181,27 +201,47 @@ class BatteryTelemetryWorker(
             currentSample: BatterySampleEntity,
             ratedCapacityMah: Int
         ): List<AppDrainEventEntity> {
-            val intervalMs = (windowEndMs - windowStartMs).coerceAtLeast(1L)
-            if (observedApps.isEmpty() || currentSample.isCharging) return emptyList()
+            if (observedApps.isEmpty() || windowEndMs <= windowStartMs) return emptyList()
 
-            val ordered = samplesInWindow.sortedBy { it.timestampMs }
-            val startAnchor = ordered.firstOrNull() ?: fallbackPrevSample ?: return emptyList()
-            val endAnchor = ordered.lastOrNull() ?: currentSample
+            val candidates = buildList {
+                if (fallbackPrevSample != null) add(fallbackPrevSample)
+                addAll(samplesInWindow)
+                add(currentSample)
+            }.distinctBy { it.timestampMs }.sortedBy { it.timestampMs }
 
-            // Calculate total discharge across the usage interval (excluding charging sub-intervals)
-            val measuredMah = if (ordered.size >= 2) {
-                var sum = 0f
-                for (i in 0 until ordered.lastIndex) {
-                    val a = ordered[i]
-                    val b = ordered[i + 1]
-                    if (a.isCharging || b.isCharging) continue
-                    val dtHours = ((b.timestampMs - a.timestampMs).coerceAtLeast(0L)) / 3_600_000f
-                    if (dtHours <= 0f) continue
-                    sum += when {
+            val latestBeforeStart = candidates.lastOrNull { it.timestampMs <= windowStartMs }
+            val insideOrAfter = candidates.filter { it.timestampMs > windowStartMs && it.timestampMs <= windowEndMs }
+            val chain = buildList {
+                if (latestBeforeStart != null) add(latestBeforeStart)
+                addAll(insideOrAfter)
+            }.distinctBy { it.timestampMs }.sortedBy { it.timestampMs }
+
+            if (chain.size < 2) return emptyList()
+
+            val subIntervals = mutableListOf<SubIntervalInfo>()
+            for (i in 0 until chain.lastIndex) {
+                val a = chain[i]
+                val b = chain[i + 1]
+                val subStart = maxOf(a.timestampMs, windowStartMs)
+                val subEnd = minOf(b.timestampMs, windowEndMs)
+                val subDurMs = subEnd - subStart
+                if (subDurMs <= 0L) continue
+
+                val isConfirmedDischarge = !a.isCharging && !b.isCharging &&
+                    !a.isConnectedToExternalPower && !b.isConnectedToExternalPower
+                val fullPairDtMs = (b.timestampMs - a.timestampMs).coerceAtLeast(1L)
+                val dtHours = fullPairDtMs / 3_600_000f
+                val aPower = if (a.hasUncertainLegacyCurrentUnit) 0f else a.powerMw
+                val bPower = if (b.hasUncertainLegacyCurrentUnit) 0f else b.powerMw
+                val avgMw = listOf(aPower, bPower).filter { it > 0f }.ifEmpty { listOf(180f) }.average().toFloat()
+
+                val fullPairMah = if (!isConfirmedDischarge) {
+                    0f
+                } else {
+                    when {
                         a.chargeCounterMicroAh > 0L && b.chargeCounterMicroAh > 0L ->
                             ((a.chargeCounterMicroAh - b.chargeCounterMicroAh) / 1000f).coerceIn(0f, 3000f)
-                        a.powerMw > 10f || b.powerMw > 10f -> {
-                            val avgMw = listOf(a.powerMw, b.powerMw).filter { it > 0f }.average().toFloat()
+                        aPower > 10f || bPower > 10f -> {
                             val avgV = ((a.voltageVolts + b.voltageVolts) / 2f).coerceIn(3.2f, 4.5f)
                             (avgMw * dtHours) / avgV
                         }
@@ -209,52 +249,97 @@ class BatteryTelemetryWorker(
                         else -> 0f
                     }
                 }
-                sum
-            } else {
-                val dtHours = intervalMs / 3_600_000f
-                val avgV = ((startAnchor.voltageVolts + endAnchor.voltageVolts) / 2f).coerceIn(3.2f, 4.5f)
-                when {
-                    startAnchor.chargeCounterMicroAh > 0L && endAnchor.chargeCounterMicroAh > 0L ->
-                        ((startAnchor.chargeCounterMicroAh - endAnchor.chargeCounterMicroAh) / 1000f)
-                            .coerceIn(0f, 3000f)
-                    startAnchor.powerMw > 10f || endAnchor.powerMw > 10f -> {
-                        val avgMw = listOf(startAnchor.powerMw, endAnchor.powerMw)
-                            .filter { it > 0f }.average().toFloat()
-                        (avgMw * dtHours) / avgV
+                val subMah = fullPairMah * (subDurMs.toFloat() / fullPairDtMs.toFloat())
+                subIntervals.add(
+                    SubIntervalInfo(
+                        startMs = subStart,
+                        endMs = subEnd,
+                        durationMs = subDurMs,
+                        isConfirmedDischarge = isConfirmedDischarge,
+                        dischargeMah = subMah,
+                        avgPowerMw = avgMw
+                    )
+                )
+            }
+
+            val dischargingSubs = subIntervals.filter { it.isConfirmedDischarge && it.dischargeMah > 0.01f }
+            if (dischargingSubs.isEmpty()) return emptyList()
+
+            val windowHasNonDischargeSub = subIntervals.any { !it.isConfirmedDischarge }
+            val appMahByPkg = mutableMapOf<String, Float>()
+            val appFgInDischargeByPkg = mutableMapOf<String, Long>()
+            val appPowerWeightedByPkg = mutableMapOf<String, Float>()
+
+            for (sub in dischargingSubs) {
+                val fgInSubByPkg = mutableMapOf<String, Long>()
+                for (app in observedApps) {
+                    val fgInSub = if (app.activeIntervals.isNotEmpty()) {
+                        app.activeIntervals.sumOf { (ivS, ivE) ->
+                            (minOf(ivE, sub.endMs) - maxOf(ivS, sub.startMs)).coerceAtLeast(0L)
+                        }.coerceAtMost(sub.durationMs)
+                    } else {
+                        val appStart = if (app.windowStartMs > 0L) app.windowStartMs else windowStartMs
+                        val appEnd = if (app.windowEndMs > appStart) app.windowEndMs else windowEndMs
+                        val overlapsNonDischarge = windowHasNonDischargeSub && subIntervals.any { other ->
+                            !other.isConfirmedDischarge && minOf(appEnd, other.endMs) > maxOf(appStart, other.startMs)
+                        }
+                        if (overlapsNonDischarge) {
+                            // Coarse app summary spans a charging/transition sub-interval without exact session bounds
+                            0L
+                        } else {
+                            val totalDischargeOverlap = dischargingSubs.sumOf { d ->
+                                (minOf(appEnd, d.endMs) - maxOf(appStart, d.startMs)).coerceAtLeast(0L)
+                            }
+                            val subOverlap = (minOf(appEnd, sub.endMs) - maxOf(appStart, sub.startMs)).coerceAtLeast(0L)
+                            if (totalDischargeOverlap > 0L && subOverlap > 0L) {
+                                ((app.foregroundMs.toDouble() * subOverlap.toDouble()) / totalDischargeOverlap.toDouble())
+                                    .toLong()
+                                    .coerceAtMost(sub.durationMs)
+                            } else {
+                                0L
+                            }
+                        }
                     }
-                    startAnchor.levelPct > endAnchor.levelPct ->
-                        ((startAnchor.levelPct - endAnchor.levelPct) / 100f) * ratedCapacityMah
-                    else -> 0f
+                    if (fgInSub > 0L) {
+                        fgInSubByPkg[app.packageName] = fgInSub
+                    }
+                }
+
+                val totalSubFgMs = fgInSubByPkg.values.sum()
+                if (totalSubFgMs <= 0L) continue
+
+                val subCoverage = (totalSubFgMs.toFloat() / sub.durationMs.toFloat()).coerceIn(0f, 1f)
+                val subAppPoolMah = sub.dischargeMah * subCoverage
+
+                for ((pkg, fgMs) in fgInSubByPkg) {
+                    val share = fgMs.toFloat() / totalSubFgMs.toFloat()
+                    val allocatedMah = abs(subAppPoolMah * share)
+                    appMahByPkg[pkg] = (appMahByPkg[pkg] ?: 0f) + allocatedMah
+                    appFgInDischargeByPkg[pkg] = (appFgInDischargeByPkg[pkg] ?: 0L) + fgMs
+                    appPowerWeightedByPkg[pkg] = (appPowerWeightedByPkg[pkg] ?: 0f) + sub.avgPowerMw * fgMs.toFloat()
                 }
             }
 
-            if (measuredMah <= 0.05f) return emptyList()
+            if (appMahByPkg.isEmpty()) return emptyList()
 
-            val totalFgMs = observedApps.sumOf { it.foregroundMs.coerceAtLeast(0L) }
-            if (totalFgMs <= 0L) return emptyList()
+            val effectiveStartMs = dischargingSubs.minOf { it.startMs }
+            val effectiveEndMs = dischargingSubs.maxOf { it.endMs }
+            val effectiveDurationMs = (effectiveEndMs - effectiveStartMs).coerceAtLeast(1L)
 
-            // Scale app-attributable pool by actual foreground time coverage inside [windowStartMs, windowEndMs].
-            // Remaining (1 - foregroundCoverage) stays unassigned idle/system energy.
-            val foregroundCoverage = (totalFgMs.toFloat() / intervalMs.toFloat()).coerceIn(0f, 1f)
-            val appPoolMah = measuredMah * foregroundCoverage
-
-            val avgPowerMw = listOf(startAnchor.powerMw, endAnchor.powerMw)
-                .filter { it > 0f }
-                .ifEmpty { listOf(180f) }
-                .average()
-                .toFloat()
-
-            return observedApps.map { app ->
-                val share = app.foregroundMs.toFloat() / totalFgMs.toFloat()
+            return observedApps.mapNotNull { app ->
+                val mah = appMahByPkg[app.packageName] ?: return@mapNotNull null
+                val fgMs = appFgInDischargeByPkg[app.packageName] ?: return@mapNotNull null
+                if (mah <= 0.01f || fgMs <= 0L) return@mapNotNull null
+                val avgPower = (appPowerWeightedByPkg[app.packageName] ?: 180f) / fgMs.toFloat()
                 AppDrainEventEntity(
-                    timestampMs = windowEndMs,
-                    intervalDurationMs = intervalMs,
+                    timestampMs = effectiveEndMs,
+                    intervalDurationMs = effectiveDurationMs,
                     packageName = app.packageName,
                     appLabel = app.appLabel,
-                    foregroundMs = app.foregroundMs,
+                    foregroundMs = fgMs,
                     launchCount = app.launchCount,
-                    estimatedMah = abs(appPoolMah * share),
-                    avgPowerMw = avgPowerMw
+                    estimatedMah = mah,
+                    avgPowerMw = avgPower
                 )
             }
         }

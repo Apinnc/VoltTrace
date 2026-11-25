@@ -29,7 +29,10 @@ data class ObservedAppUsage(
     val packageName: String,
     val appLabel: String,
     val foregroundMs: Long,
-    val launchCount: Int
+    val launchCount: Int,
+    val activeIntervals: List<Pair<Long, Long>> = emptyList(),
+    val windowStartMs: Long = 0L,
+    val windowEndMs: Long = 0L
 )
 
 class BatteryHardwareReader(private val context: Context) {
@@ -109,12 +112,17 @@ class BatteryHardwareReader(private val context: Context) {
         val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
             status == BatteryManager.BATTERY_STATUS_FULL
 
-        val pluggedCode = intent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) ?: 0
-        val pluggedType = when (pluggedCode) {
-            BatteryManager.BATTERY_PLUGGED_AC -> "AC"
-            BatteryManager.BATTERY_PLUGGED_USB -> "USB"
-            BatteryManager.BATTERY_PLUGGED_WIRELESS -> "WIRELESS"
-            else -> "BATTERY"
+        val hasPluggedExtra = intent?.hasExtra(BatteryManager.EXTRA_PLUGGED) == true
+        val pluggedCode = intent?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1
+        val pluggedType = when {
+            !hasPluggedExtra || pluggedCode < 0 -> "UNKNOWN"
+            pluggedCode == BatteryManager.BATTERY_PLUGGED_AC -> "AC"
+            pluggedCode == BatteryManager.BATTERY_PLUGGED_USB -> "USB"
+            pluggedCode == BatteryManager.BATTERY_PLUGGED_WIRELESS -> "WIRELESS"
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+                pluggedCode == BatteryManager.BATTERY_PLUGGED_DOCK -> "DOCK"
+            pluggedCode == 0 -> "BATTERY"
+            else -> "AC"
         }
 
         val healthCode = intent?.getIntExtra(
@@ -127,11 +135,20 @@ class BatteryHardwareReader(private val context: Context) {
 
         val rawCurrent = batteryManager
             ?.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
-            ?.let { if (it == Long.MIN_VALUE) 0L else it } ?: 0L
+            ?: Long.MIN_VALUE
         val rawAvgCurrent = batteryManager
             ?.getLongProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE)
-            ?.let { if (it == Long.MIN_VALUE) 0L else it } ?: 0L
-        val normalizedCurrentMicroA = normalizeCurrentToMicroAmps(rawCurrent, rawAvgCurrent, isCharging)
+            ?: Long.MIN_VALUE
+        val effectiveRawCurrent = if (isCurrentReadingAvailable(rawCurrent)) {
+            rawCurrent
+        } else {
+            rawAvgCurrent
+        }
+        val normalizedCurrentMicroA = normalizeCurrentToMicroAmps(
+            raw = effectiveRawCurrent,
+            rawAvg = rawAvgCurrent,
+            isCharging = isCharging
+        )
 
         val chargeCounter = batteryManager
             ?.getLongProperty(BatteryManager.BATTERY_PROPERTY_CHARGE_COUNTER)
@@ -191,35 +208,35 @@ class BatteryHardwareReader(private val context: Context) {
             uptimeMs = uptimeMs,
             foregroundPackage = foregroundApp?.first,
             foregroundLabel = foregroundApp?.second,
-            source = source
+            source = source,
+            currentUnitVerified = true
         )
     }
 
     /**
-     * Normalizes OEM current reporting to canonical signed microamperes (µA):
-     * positive (+) when charging, negative (-) when discharging.
+     * Normalizes OEM current reporting to canonical signed microamperes (µA),
+     * preserving the actual sign reported by the battery gauge independently of `isCharging`.
      *
      * Android documents BATTERY_PROPERTY_CURRENT_NOW and BATTERY_PROPERTY_CURRENT_AVERAGE
-     * in microamperes (µA). We preserve µA directly—including small valid standby currents
-     * like 8,000 µA (8 mA, 0.032 W at 4 V)—in both pre-calibration and post-calibration states.
-     * Only verified legacy pre-Android 10 Samsung HALs known to report raw mA are scaled by 1000x
-     * when no µA-scale reading has ever been observed.
+     * in signed microamperes (µA). We preserve both sign and µA magnitude directly.
+     * Any legacy milliamp-HAL scaling is restricted to cases where explicit calibration
+     * evidence (`verified_legacy_ma_hal`) has been recorded.
      */
     private fun normalizeCurrentToMicroAmps(raw: Long, rawAvg: Long, isCharging: Boolean): Long {
-        val absRaw = abs(raw)
-        val absAvg = abs(rawAvg)
+        if (!isCurrentReadingAvailable(raw)) return 0L
+        val absRaw = if (raw == Long.MIN_VALUE) 0L else abs(raw)
+        val absAvg = if (rawAvg == Long.MIN_VALUE) 0L else abs(rawAvg)
         if (!halUsesMicroAmps && (absRaw >= 10_000L || absAvg >= 10_000L)) {
             halUsesMicroAmps = true
             halPrefs.edit().putBoolean("hal_uses_micro_amps", true).apply()
         }
-        val isVerifiedLegacyMilliampHal = !halUsesMicroAmps &&
-            Build.MANUFACTURER.equals("samsung", ignoreCase = true) &&
-            Build.VERSION.SDK_INT < Build.VERSION_CODES.Q
+        val hasVerifiedLegacyMaEvidence = !halUsesMicroAmps &&
+            halPrefs.getBoolean("verified_legacy_ma_hal", false)
         return normalizeCurrentReadingToMicroAmps(
             raw = raw,
             isCharging = isCharging,
             halUsesMicroAmps = halUsesMicroAmps,
-            isLegacyMilliampHal = isVerifiedLegacyMilliampHal
+            isLegacyMilliampHal = hasVerifiedLegacyMaEvidence
         )
     }
 
@@ -420,14 +437,18 @@ class BatteryHardwareReader(private val context: Context) {
 
             intervalsByPkg.entries
                 .mapNotNull { (pkg, rawIntervals) ->
-                    val mergedDuration = mergeIntervalsDuration(rawIntervals)
+                    val mergedIntervals = mergeIntervals(rawIntervals)
+                    val mergedDuration = mergedIntervals.sumOf { (s, e) -> (e - s).coerceAtLeast(0L) }
                         .coerceAtMost(windowDurationMs)
                     if (mergedDuration < 1_000L) return@mapNotNull null
                     ObservedAppUsage(
                         packageName = pkg,
                         appLabel = resolveAppLabel(pkg),
                         foregroundMs = mergedDuration,
-                        launchCount = (launchCounts[pkg] ?: 1).coerceAtLeast(1)
+                        launchCount = (launchCounts[pkg] ?: 1).coerceAtLeast(1),
+                        activeIntervals = mergedIntervals,
+                        windowStartMs = startMs,
+                        windowEndMs = endMs
                     )
                 }
                 .sortedByDescending { it.foregroundMs }
@@ -536,30 +557,40 @@ class BatteryHardwareReader(private val context: Context) {
 
     companion object {
         /**
+         * Returns true when an Android BatteryManager current property reading is present
+         * (`Long.MIN_VALUE` is Android's sentinel for an unsupported/unavailable property).
+         */
+        fun isCurrentReadingAvailable(raw: Long): Boolean = raw != Long.MIN_VALUE
+
+        /**
          * Pure conversion from raw Android BatteryManager current property to canonical signed µA.
-         * Standard Android HALs report µA directly (including small valid standby values such as
-         * 8,000 µA = 8 mA = 0.032 W at 4 V). Only verified legacy mA-reporting HALs scale by 1000x.
+         *
+         * Preserves the actual sign reported by the battery gauge independently of `isCharging`
+         * (e.g., `-250,000 µA` remains `-250,000 µA` / `-250 mA` / `-1.0 W` at 4 V even when
+         * OS charging status is `FULL` or `CHARGING`). Returns `0L` for `0L` or unavailable
+         * (`Long.MIN_VALUE`) readings. Only verified legacy mA-reporting HALs with supporting
+         * evidence scale by 1000x.
          */
         fun normalizeCurrentReadingToMicroAmps(
             raw: Long,
-            isCharging: Boolean,
-            halUsesMicroAmps: Boolean,
+            @Suppress("UNUSED_PARAMETER") isCharging: Boolean = false,
+            halUsesMicroAmps: Boolean = true,
             isLegacyMilliampHal: Boolean = false
         ): Long {
+            if (raw == 0L || raw == Long.MIN_VALUE) return 0L
             val absRaw = abs(raw)
-            if (absRaw == 0L) return 0L
             val magnitudeMicroA = if (!halUsesMicroAmps && isLegacyMilliampHal && absRaw <= 9_500L) {
                 absRaw * 1000L
             } else {
                 absRaw
             }
-            return if (isCharging) magnitudeMicroA else -magnitudeMicroA
+            return if (raw < 0L) -magnitudeMicroA else magnitudeMicroA
         }
 
-        fun mergeIntervalsDuration(intervals: List<Pair<Long, Long>>): Long {
-            if (intervals.isEmpty()) return 0L
+        fun mergeIntervals(intervals: List<Pair<Long, Long>>): List<Pair<Long, Long>> {
+            if (intervals.isEmpty()) return emptyList()
             val sorted = intervals.sortedBy { it.first }
-            var total = 0L
+            val merged = mutableListOf<Pair<Long, Long>>()
             var curStart = sorted[0].first
             var curEnd = sorted[0].second
             for (i in 1 until sorted.size) {
@@ -567,13 +598,17 @@ class BatteryHardwareReader(private val context: Context) {
                 if (s <= curEnd) {
                     if (e > curEnd) curEnd = e
                 } else {
-                    total += (curEnd - curStart).coerceAtLeast(0L)
+                    if (curEnd > curStart) merged.add(curStart to curEnd)
                     curStart = s
                     curEnd = e
                 }
             }
-            total += (curEnd - curStart).coerceAtLeast(0L)
-            return total
+            if (curEnd > curStart) merged.add(curStart to curEnd)
+            return merged
+        }
+
+        fun mergeIntervalsDuration(intervals: List<Pair<Long, Long>>): Long {
+            return mergeIntervals(intervals).sumOf { (s, e) -> (e - s).coerceAtLeast(0L) }
         }
 
         fun healthLabel(healthCode: Int): String = when (healthCode) {

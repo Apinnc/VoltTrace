@@ -38,6 +38,8 @@ data class SpikeForensicReport(
     val summaryHeadline: String,
     val chargeLostBeforeMah: Float?,
     val chargeLostAfterMah: Float?,
+    val counterMeasuredBefore: Boolean = false,
+    val counterMeasuredAfter: Boolean = false,
     val counterMeasured: Boolean,
     val cpuAwakeBeforeMs: Long?,
     val deepSleepBeforeMs: Long?,
@@ -64,6 +66,27 @@ data class SpikeForensicReport(
 object SpikeInspector {
 
     /**
+     * Computes the exact evidence window [windowStartMs, windowEndMs] for an inspected sample
+     * so UI display, UsageEvents queries, app usage queries, and event correlation all use the
+     * identical time bounds.
+     */
+    fun computeSpikeWindowBounds(
+        samples: List<BatterySampleEntity>,
+        targetIndex: Int
+    ): Pair<Long, Long> {
+        val safeIdx = targetIndex.coerceIn(0, (samples.size - 1).coerceAtLeast(0))
+        val target = samples[safeIdx]
+        val prev = samples.getOrNull(safeIdx - 1)
+        val next = samples.getOrNull(safeIdx + 1)
+
+        val windowStartMs = prev?.timestampMs?.coerceAtLeast(target.timestampMs - 20L * 60_000L)
+            ?: (target.timestampMs - 10L * 60_000L)
+        val windowEndMs = next?.timestampMs?.coerceAtMost(target.timestampMs + 10L * 60_000L)
+            ?: (target.timestampMs + 5L * 60_000L)
+        return windowStartMs to windowEndMs
+    }
+
+    /**
      * Identifies notable spikes in the current timeline window so the user can jump directly
      * to unexplained standby bursts or high-wattage discharge peaks.
      */
@@ -74,11 +97,12 @@ object SpikeInspector {
 
         for (i in samples.indices) {
             val s = samples[i]
+            if (s.hasUncertainLegacyCurrentUnit) continue
             val prev = samples.getOrNull(i - 1)
             val next = samples.getOrNull(i + 1)
 
-            val prevPower = prev?.powerMw ?: 0f
-            val nextPower = next?.powerMw ?: 0f
+            val prevPower = if (prev?.hasUncertainLegacyCurrentUnit == true) 0f else (prev?.powerMw ?: 0f)
+            val nextPower = if (next?.hasUncertainLegacyCurrentUnit == true) 0f else (next?.powerMw ?: 0f)
             val isLocalPeak = s.powerMw >= prevPower && s.powerMw >= nextPower
 
             // Prioritize discharging spikes, especially screen-off standby spikes
@@ -151,14 +175,15 @@ object SpikeInspector {
         val prev = samples.getOrNull(safeIdx - 1)
         val next = samples.getOrNull(safeIdx + 1)
 
-        val windowStartMs = prev?.timestampMs?.coerceAtLeast(target.timestampMs - 20L * 60_000L)
-            ?: (target.timestampMs - 10L * 60_000L)
-        val windowEndMs = next?.timestampMs?.coerceAtMost(target.timestampMs + 10L * 60_000L)
-            ?: (target.timestampMs + 5L * 60_000L)
+        val (windowStartMs, windowEndMs) = computeSpikeWindowBounds(samples, safeIdx)
 
         val (chargeBefore, counterBefore) = computePairChargeLoss(prev, target, ratedCapacityMah)
         val (chargeAfter, counterAfter) = computePairChargeLoss(target, next, ratedCapacityMah)
-        val counterMeasured = counterBefore || counterAfter
+        // Only mark overall counterMeasured true when every present side is counter-measured;
+        // each side's own provenance is tracked explicitly in counterMeasuredBefore / counterMeasuredAfter.
+        val counterMeasured = (chargeBefore != null || chargeAfter != null) &&
+            (chargeBefore == null || counterBefore) &&
+            (chargeAfter == null || counterAfter)
 
         val clocksBefore = computeBootClockDeltas(prev, target)
         val clocksAfter = computeBootClockDeltas(target, next)
@@ -167,14 +192,37 @@ object SpikeInspector {
         val tempDeltaC = prev?.let { target.temperatureCelsius - it.temperatureCelsius }
 
         val (classification, severity, headline) = when {
+            target.hasUncertainLegacyCurrentUnit -> Triple(
+                "Pre-v8 Sample (Uncertain Current Unit)",
+                CauseSeverity.ELEVATED,
+                String.format(
+                    Locale.US,
+                    "Imported or upgraded pre-v8 row at %d%% SOC (%.1f°C) has an ambiguous current scale and is excluded from peak wattage claims.",
+                    target.levelPct,
+                    target.temperatureCelsius
+                )
+            )
+            target.isCharging && target.powerSignedMw < 0f -> Triple(
+                "Charging Status (Net Battery Discharge)",
+                CauseSeverity.ELEVATED,
+                String.format(
+                    Locale.US,
+                    "Plugged in (%s) with OS charging status, but net current is %+.2f W (%+.0f mA) at %d%% SOC.",
+                    target.pluggedType,
+                    target.powerSignedWatts,
+                    target.currentSignedMa,
+                    target.levelPct
+                )
+            )
             target.isCharging -> Triple(
                 "Charging Current (Not Battery Drain)",
                 CauseSeverity.HEALTHY,
                 String.format(
                     Locale.US,
-                    "Plugged in (%s) drawing %+.2f W at %d%% SOC — power is entering the battery, not draining it.",
+                    "Plugged in (%s) with %+.2f W (%+.0f mA) at %d%% SOC.",
                     target.pluggedType,
                     target.powerSignedWatts,
+                    target.currentSignedMa,
                     target.levelPct
                 )
             )
@@ -251,8 +299,24 @@ object SpikeInspector {
 
         val liveHardware = RootCauseAnalyzer.estimateLiveSubsystems(target)
 
+        // Strictly restrict usageEvents and appUsage to the displayed evidence window [windowStartMs, windowEndMs]
+        val inWindowUsageEvents = usageEvents.filter { it.timestampMs in windowStartMs..windowEndMs }
+        val inWindowAppUsage = appUsage.mapNotNull { app ->
+            if (app.activeIntervals.isNotEmpty()) {
+                val overlapFg = app.activeIntervals.sumOf { (ivS, ivE) ->
+                    (minOf(ivE, windowEndMs) - maxOf(ivS, windowStartMs)).coerceAtLeast(0L)
+                }
+                if (overlapFg > 0L) app.copy(foregroundMs = overlapFg) else null
+            } else if (app.windowEndMs > app.windowStartMs && app.windowStartMs > 0L) {
+                val overlap = minOf(app.windowEndMs, windowEndMs) - maxOf(app.windowStartMs, windowStartMs)
+                if (overlap <= 0L) null else app
+            } else {
+                app
+            }
+        }
+
         // Strictly intersect persisted Room AppDrainEvent intervals [start, end] with [windowStartMs, windowEndMs]
-        val directAppPackages = appUsage.map { it.packageName }.toSet()
+        val directAppPackages = inWindowAppUsage.map { it.packageName }.toSet()
         val overlappingPersistedApps = appDrainEvents
             .mapNotNull { ev ->
                 val evEnd = ev.timestampMs
@@ -282,7 +346,7 @@ object SpikeInspector {
                     launchCount = rows.sumOf { (ev, _) -> ev.launchCount }.coerceAtLeast(1)
                 )
             }
-        val mergedApps = (appUsage + overlappingPersistedApps)
+        val mergedApps = (inWindowAppUsage + overlappingPersistedApps)
             .groupBy { it.packageName }
             .map { (pkg, list) ->
                 ObservedAppUsage(
@@ -308,16 +372,16 @@ object SpikeInspector {
             avgVoltageVolts = target.voltageVolts.coerceIn(3.4f, 4.4f)
         ).filter { it.deltaMWh > 0.01f }
 
-        val bgServices = usageEvents.filter { it.isBackgroundService }
+        val bgServices = inWindowUsageEvents.filter { it.isBackgroundService }
         val fgAppAtBoundary = (target.foregroundLabel ?: target.foregroundPackage)?.takeIf { it.isNotBlank() }
 
         val likelyDrivers = buildList {
             if (target.isCharging) {
-                add("Device was actively plugged into ${target.pluggedType} power — current shown is charge input, not battery drain.")
+                add("Device was connected to ${target.pluggedType} power (${String.format(Locale.US, "%+.0f mA", target.currentSignedMa)}).")
             } else {
                 if (bgServices.isNotEmpty()) {
                     val names = bgServices.map { it.appLabel }.distinct().take(4).joinToString(", ")
-                    add("Background foreground-service activity recorded around this timestamp: $names.")
+                    add("Background foreground-service activity recorded within this window: $names.")
                 }
                 if (fgAppAtBoundary != null) {
                     add("Foreground app recorded at this sample: $fgAppAtBoundary.")
@@ -349,13 +413,23 @@ object SpikeInspector {
                     add("Display was ON at ${target.screenBrightnessPct}% brightness (${target.displayRefreshRateHz.toInt()} Hz).")
                 }
                 if (chargeBefore != null && chargeBefore >= 30f) {
-                    add(
-                        String.format(
-                            Locale.US,
-                            "Confirmed %.1f mAh real charge loss in the interval leading into this spike.",
-                            chargeBefore
+                    if (counterBefore) {
+                        add(
+                            String.format(
+                                Locale.US,
+                                "Confirmed %.1f mAh counter-measured charge loss in the interval leading into this spike.",
+                                chargeBefore
+                            )
                         )
-                    )
+                    } else {
+                        add(
+                            String.format(
+                                Locale.US,
+                                "Estimated %.1f mAh charge loss (from battery %% drop) in the interval leading into this spike.",
+                                chargeBefore
+                            )
+                        )
+                    }
                 }
                 if (isEmpty()) {
                     add("Short transient burst with no foreground app or radio handoff logged at the sample boundary.")
@@ -366,7 +440,7 @@ object SpikeInspector {
         val unknowns = buildList {
             if (!hasUsageAccess) {
                 add("Usage Access permission is not granted — grant it on the Causes or Inspector tab so VoltTrace can list exact apps and background services active during spikes.")
-            } else if (usageEvents.isEmpty() && !target.isCharging) {
+            } else if (inWindowUsageEvents.isEmpty() && !target.isCharging) {
                 add("No foreground app opens or foreground-service starts were emitted by Android UsageEvents within this window — activity was likely an OS/kernel background job, sync, or partial wakelock.")
             }
             if (prev != null && (target.timestampMs - prev.timestampMs) >= 12L * 60_000L) {
@@ -401,6 +475,8 @@ object SpikeInspector {
             summaryHeadline = headline,
             chargeLostBeforeMah = chargeBefore,
             chargeLostAfterMah = chargeAfter,
+            counterMeasuredBefore = counterBefore,
+            counterMeasuredAfter = counterAfter,
             counterMeasured = counterMeasured,
             cpuAwakeBeforeMs = clocksBefore?.awakeMs,
             deepSleepBeforeMs = clocksBefore?.sleepMs,
@@ -412,7 +488,7 @@ object SpikeInspector {
             tempDeltaC = tempDeltaC,
             stateChanges = stateChanges,
             liveHardwareBreakdown = liveHardware,
-            correlatedEvents = usageEvents,
+            correlatedEvents = inWindowUsageEvents,
             correlatedAppUsage = mergedApps,
             energyMeterDeltas = meterDeltas,
             likelyDrivers = likelyDrivers,

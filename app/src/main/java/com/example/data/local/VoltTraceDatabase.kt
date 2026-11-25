@@ -13,7 +13,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         AppDrainEventEntity::class,
         EnergyMeterSnapshotEntity::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = false
 )
 abstract class VoltTraceDatabase : RoomDatabase() {
@@ -69,6 +69,19 @@ abstract class VoltTraceDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * Marks existing pre-v8 rows with `currentUnitVerified = 0` (`false`) so legacy rows
+         * that may have been scaled by v7's pre-calibration 1000x multiplier (e.g. -8,000,000 µA)
+         * are retained intact while treated as unit-uncertain for peaks, alerts, and conclusions.
+         */
+        val MIGRATION_4_5 = object : Migration(4, 5) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE battery_samples ADD COLUMN currentUnitVerified INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
+
         fun getInstance(context: Context): VoltTraceDatabase {
             return INSTANCE ?: synchronized(this) {
                 INSTANCE ?: Room.databaseBuilder(
@@ -76,7 +89,7 @@ abstract class VoltTraceDatabase : RoomDatabase() {
                     VoltTraceDatabase::class.java,
                     "volttrace_telemetry.db"
                 )
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
                     .build()
                     .also { INSTANCE = it }
             }

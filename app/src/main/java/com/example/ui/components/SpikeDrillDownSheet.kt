@@ -181,10 +181,16 @@ fun SpikeDrillDownBottomSheet(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    val currentDetail = when {
+                        target.currentSignedMa > 0.05f -> "Into battery (${target.pluggedType})"
+                        target.currentSignedMa < -0.05f && target.isCharging -> "Net discharge while ${target.pluggedType} charging"
+                        target.currentSignedMa < -0.05f -> "Out of battery (${target.pluggedType})"
+                        else -> "Idle / 0 mA (${target.pluggedType})"
+                    }
                     ForensicMetricTile(
                         label = "Current",
                         value = String.format(Locale.US, "%+.0f mA", target.currentSignedMa),
-                        detail = if (target.isCharging) "Into battery (${target.pluggedType})" else "Out of battery",
+                        detail = currentDetail,
                         accent = accent,
                         modifier = Modifier.weight(1f)
                     )
@@ -219,8 +225,10 @@ fun SpikeDrillDownBottomSheet(
                     }
                     val chargeSub = when {
                         target.isCharging -> "No discharge loss"
-                        report.counterMeasured -> "Battery counter (before)"
-                        report.chargeLostBeforeMah != null -> "Estimated from SOC %"
+                        report.chargeLostBeforeMah != null && report.counterMeasuredBefore -> "Battery counter (before)"
+                        report.chargeLostBeforeMah != null -> "Estimated from SOC % (before)"
+                        report.chargeLostAfterMah != null && report.counterMeasuredAfter -> "Battery counter (after)"
+                        report.chargeLostAfterMah != null -> "Estimated from SOC % (after)"
                         else -> "Single boundary sample"
                     }
                     ForensicMetricTile(
@@ -333,7 +341,7 @@ fun SpikeDrillDownBottomSheet(
                             modifier = Modifier.size(17.dp)
                         )
                         Text(
-                            text = "Apps & Background Services (±10 min)",
+                            text = "Apps & Background Services (${clockFmt.format(Date(report.windowStartMs))} – ${clockFmt.format(Date(report.windowEndMs))})",
                             style = MaterialTheme.typography.labelLarge,
                             color = MaterialTheme.colorScheme.onSurface
                         )

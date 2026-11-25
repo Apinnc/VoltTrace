@@ -190,12 +190,20 @@ object BatteryAlertManager {
         matchedAtMs: Long,
         settings: UserMonitorSettings,
         preferences: MonitorPreferences
-    ) {
-        if (!settings.watchConfig.active) return
-        if (matchedEventId.isBlank() || matchedEventId == settings.watchConfig.lastMatchedEventId) return
-        if (matchedAtMs <= settings.watchConfig.armedAtMs || matchedAtMs <= settings.watchConfig.lastMatchedAtMs) return
+    ): Boolean {
+        if (!settings.watchConfig.active) return false
+        if (matchedEventId.isBlank() || matchedAtMs <= settings.watchConfig.armedAtMs) return false
+
+        // 1. Record match count idempotently (deduplicated against lastMatchedEventId)
         preferences.recordWatchMatch(matchedEventId, matchedAtMs, reason)
-        if (!settings.criticalAlertsEnabled || !hasNotificationPermission(context)) return
+
+        // 2. Deliver notification idempotently (deduplicated separately against lastNotifiedEventId
+        //    so opening the screen before the worker runs never suppresses the notification)
+        if (!settings.criticalAlertsEnabled || !hasNotificationPermission(context)) return false
+        if (matchedEventId == settings.watchConfig.lastNotifiedEventId) return false
+        val shouldNotify = preferences.tryRecordWatchNotified(matchedEventId, matchedAtMs)
+        if (!shouldNotify) return false
+
         ensureChannels(context)
         postCriticalNotification(
             context = context,
@@ -204,6 +212,7 @@ object BatteryAlertManager {
             body = "$reason. Open VoltTrace to replay the window.",
             targetRoute = "live"
         )
+        return true
     }
 
     private fun postCriticalNotification(

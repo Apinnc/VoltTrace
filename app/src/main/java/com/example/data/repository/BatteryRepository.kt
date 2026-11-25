@@ -82,6 +82,16 @@ class BatteryRepository(
             hardwareReader.queryDetailedEventsAround(startMs, endMs)
         }
 
+    suspend fun getEnergyMetersInRange(startMs: Long, endMs: Long): List<EnergyMeterSnapshotEntity> =
+        withContext(Dispatchers.IO) {
+            batteryDao.getEnergyMetersInRange(startMs, endMs)
+        }
+
+    suspend fun getAppEventsInRange(startMs: Long, endMs: Long): List<AppDrainEventEntity> =
+        withContext(Dispatchers.IO) {
+            batteryDao.getAppEventsInRange(startMs, endMs)
+        }
+
     suspend fun recordSample(sample: BatterySampleEntity): Long = withContext(Dispatchers.IO) {
         val id = batteryDao.insertSample(sample)
         runCatching { VoltTraceWidgetUpdater.updateAllWidgets(context) }

@@ -116,7 +116,8 @@ data class AppDrainAttribution(
     val avgPowerMw: Float,
     val drainRatePctPerHour: Float,
     val isHighIntensity: Boolean,
-    val hasEnergyEstimate: Boolean = true
+    val hasEnergyEstimate: Boolean = true,
+    val isUniformTimeEstimate: Boolean = false
 )
 
 data class ProbeSessionResult(
@@ -167,7 +168,11 @@ data class DrainEpisode(
     val observedActivity: List<String>,
     val whatRemainsUnknown: List<String>,
     val sourceReadings: List<String>,
-    val severity: CauseSeverity
+    val severity: CauseSeverity,
+    val counterMeasuredMah: Float = if (counterMeasured) chargeLostMah else 0f,
+    val estimatedMah: Float = if (counterMeasured) 0f else chargeLostMah,
+    val chargeEvidenceSource: ChargeEvidenceSource =
+        if (counterMeasured) ChargeEvidenceSource.COUNTER_MEASURED else ChargeEvidenceSource.ESTIMATED
 )
 
 data class BatteryAnalysisReport(
@@ -191,6 +196,9 @@ data class BatteryAnalysisReport(
     val screenOffDurationMs: Long,
     val chargingDurationMs: Long = 0L,
     val mixedTransitionDurationMs: Long = 0L,
+    val plugTransitionDurationMs: Long = 0L,
+    val plugTransitionDischargedMah: Float = 0f,
+    val plugTransitionChargedMah: Float = 0f,
     val gapDurationMs: Long = 0L,
     val totalChargedMah: Float = 0f,
     val netChargeDeltaMah: Float = totalChargedMah - totalDischargedMah,
@@ -206,7 +214,12 @@ data class BatteryAnalysisReport(
     val totalUnpluggedAwakeMs: Long = 0L,
     val totalUnpluggedDeepSleepMs: Long = 0L,
     val chargeCounterMeasured: Boolean = false,
+    val counterMeasuredDischargedMah: Float = if (chargeCounterMeasured) totalDischargedMah else 0f,
+    val estimatedDischargedMah: Float = if (chargeCounterMeasured) 0f else totalDischargedMah,
+    val chargeEvidenceSource: ChargeEvidenceSource =
+        if (chargeCounterMeasured) ChargeEvidenceSource.COUNTER_MEASURED else ChargeEvidenceSource.ESTIMATED,
     val missingClockSampleCount: Int = 0,
+    val uncertainLegacyUnitSampleCount: Int = 0,
     val hardwareAttributionMode: String = "Modeled Component Split (0 Hardware Energy Meters Recorded in Window)",
     val discoveredEnergyMeters: List<EnergyMeterSummary> = emptyList(),
     val drainEpisodes: List<DrainEpisode> = emptyList(),

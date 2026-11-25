@@ -277,6 +277,9 @@ class VoltTraceViewModel(
 
     fun advanceWindowClock(nowMs: Long = clockMs()) {
         _windowClockTickMs.value = nowMs
+        if (_hasUsageAccess.value) {
+            refreshLiveAppUsageForClock(nowMs)
+        }
     }
 
     override fun onCleared() {
@@ -295,19 +298,26 @@ class VoltTraceViewModel(
 
     fun selectWindow(window: AnalysisWindow) {
         _selectedWindow.value = window
-        advanceWindowClock()
-        refreshUsageAccessAndApps()
+        val now = clockMs()
+        _windowClockTickMs.value = now
+        refreshUsageAccessAndApps(now)
     }
 
-    fun refreshUsageAccessAndApps() {
+    private fun refreshLiveAppUsageForClock(nowMs: Long = clockMs()) {
+        viewModelScope.launch {
+            val duration = _selectedWindow.value.durationMs ?: (7L * 24L * 60L * 60L * 1000L)
+            val since = (nowMs - duration).coerceAtLeast(0L)
+            _liveAppUsage.value = repository.queryAppUsageRange(since, nowMs)
+        }
+    }
+
+    fun refreshUsageAccessAndApps(nowMs: Long = clockMs()) {
         val granted = repository.hasUsageStatsPermission()
         _hasUsageAccess.value = granted
         if (granted) {
-            viewModelScope.launch {
-                val duration = _selectedWindow.value.durationMs ?: (7L * 24L * 60L * 60L * 1000L)
-                val since = System.currentTimeMillis() - duration
-                _liveAppUsage.value = repository.queryRecentAppUsage(since)
-            }
+            refreshLiveAppUsageForClock(nowMs)
+        } else {
+            _liveAppUsage.value = emptyList()
         }
     }
 
@@ -320,16 +330,7 @@ class VoltTraceViewModel(
     fun inspectTimelineSample(sampleIndex: Int) {
         val samples = windowSamples.value
         if (samples.isEmpty() || sampleIndex !in samples.indices) return
-        val target = samples[sampleIndex]
-        val prev = samples.getOrNull(sampleIndex - 1)
-        val next = samples.getOrNull(sampleIndex + 1)
-
-        val queryStartMs = (prev?.timestampMs ?: (target.timestampMs - 10L * 60_000L))
-            .coerceAtLeast(target.timestampMs - 20L * 60_000L)
-            .coerceAtMost(target.timestampMs - 5L * 60_000L)
-        val queryEndMs = (next?.timestampMs ?: (target.timestampMs + 5L * 60_000L))
-            .coerceAtMost(target.timestampMs + 10L * 60_000L)
-            .coerceAtLeast(target.timestampMs + 3L * 60_000L)
+        val (windowStartMs, windowEndMs) = SpikeInspector.computeSpikeWindowBounds(samples, sampleIndex)
 
         spikeJob?.cancel()
         spikeJob = viewModelScope.launch {
@@ -338,25 +339,37 @@ class VoltTraceViewModel(
             _hasUsageAccess.value = usageGranted
 
             val events = if (usageGranted) {
-                runCatching { repository.queryDetailedEventsAround(queryStartMs, queryEndMs) }
+                runCatching { repository.queryDetailedEventsAround(windowStartMs, windowEndMs) }
                     .getOrDefault(emptyList())
             } else {
                 emptyList()
             }
             val apps = if (usageGranted) {
-                runCatching { repository.queryAppUsageRange(queryStartMs, queryEndMs) }
+                runCatching { repository.queryAppUsageRange(windowStartMs, windowEndMs) }
                     .getOrDefault(emptyList())
             } else {
                 emptyList()
             }
+            val spikeMeters = runCatching {
+                repository.getEnergyMetersInRange(
+                    windowStartMs - 20L * 60_000L,
+                    windowEndMs + 20L * 60_000L
+                )
+            }.getOrDefault(emptyList()).ifEmpty { windowEnergyMeters.value }
+            val spikeAppEvents = runCatching {
+                repository.getAppEventsInRange(
+                    windowStartMs - 4L * 60L * 60_000L,
+                    windowEndMs + 60_000L
+                )
+            }.getOrDefault(emptyList()).ifEmpty { windowAppEvents.value }
 
             _selectedSpikeReport.value = SpikeInspector.analyzeSpike(
                 samples = samples,
                 targetIndex = sampleIndex,
                 usageEvents = events,
                 appUsage = apps,
-                appDrainEvents = windowAppEvents.value,
-                energyMeters = windowEnergyMeters.value,
+                appDrainEvents = spikeAppEvents,
+                energyMeters = spikeMeters,
                 hasUsageAccess = usageGranted,
                 ratedCapacityMah = settings.value.ratedCapacityMah
             )
@@ -395,7 +408,7 @@ class VoltTraceViewModel(
                     suspectPackage = report.suggestedWatchPackage,
                     triggerDrainPctPerHour = report.suggestedTriggerRatePctHr,
                     triggerPeakMw = report.suggestedTriggerPeakMw,
-                    armedAtMs = System.currentTimeMillis(),
+                    armedAtMs = clockMs(),
                     matchCount = 0,
                     lastMatchedAtMs = 0L,
                     lastMatchSummary = ""
@@ -411,16 +424,7 @@ class VoltTraceViewModel(
         val idx = samples.indexOfFirst { it.id == sample.id && it.timestampMs == sample.timestampMs }
             .takeIf { it >= 0 } ?: return
         _showOvernightReplaySheet.value = false
-        val target = samples[idx]
-        val prev = samples.getOrNull(idx - 1)
-        val next = samples.getOrNull(idx + 1)
-
-        val queryStartMs = (prev?.timestampMs ?: (target.timestampMs - 10L * 60_000L))
-            .coerceAtLeast(target.timestampMs - 20L * 60_000L)
-            .coerceAtMost(target.timestampMs - 5L * 60_000L)
-        val queryEndMs = (next?.timestampMs ?: (target.timestampMs + 5L * 60_000L))
-            .coerceAtMost(target.timestampMs + 10L * 60_000L)
-            .coerceAtLeast(target.timestampMs + 3L * 60_000L)
+        val (windowStartMs, windowEndMs) = SpikeInspector.computeSpikeWindowBounds(samples, idx)
 
         spikeJob?.cancel()
         spikeJob = viewModelScope.launch {
@@ -428,25 +432,37 @@ class VoltTraceViewModel(
             val usageGranted = repository.hasUsageStatsPermission()
             _hasUsageAccess.value = usageGranted
             val events = if (usageGranted) {
-                runCatching { repository.queryDetailedEventsAround(queryStartMs, queryEndMs) }
+                runCatching { repository.queryDetailedEventsAround(windowStartMs, windowEndMs) }
                     .getOrDefault(emptyList())
             } else {
                 emptyList()
             }
             val apps = if (usageGranted) {
-                runCatching { repository.queryAppUsageRange(queryStartMs, queryEndMs) }
+                runCatching { repository.queryAppUsageRange(windowStartMs, windowEndMs) }
                     .getOrDefault(emptyList())
             } else {
                 emptyList()
             }
+            val spikeMeters = runCatching {
+                repository.getEnergyMetersInRange(
+                    windowStartMs - 20L * 60_000L,
+                    windowEndMs + 20L * 60_000L
+                )
+            }.getOrDefault(emptyList()).ifEmpty { windowEnergyMeters.value }
+            val spikeAppEvents = runCatching {
+                repository.getAppEventsInRange(
+                    windowStartMs - 4L * 60L * 60_000L,
+                    windowEndMs + 60_000L
+                )
+            }.getOrDefault(emptyList()).ifEmpty { recentOvernightAppEvents.value }
 
             _selectedSpikeReport.value = SpikeInspector.analyzeSpike(
                 samples = samples,
                 targetIndex = idx,
                 usageEvents = events,
                 appUsage = apps,
-                appDrainEvents = recentOvernightAppEvents.value,
-                energyMeters = windowEnergyMeters.value,
+                appDrainEvents = spikeAppEvents,
+                energyMeters = spikeMeters,
                 hasUsageAccess = usageGranted,
                 ratedCapacityMah = settings.value.ratedCapacityMah
             )

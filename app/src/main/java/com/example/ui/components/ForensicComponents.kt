@@ -462,8 +462,13 @@ fun DrainEpisodesCard(
                                             color = accent.copy(alpha = 0.14f),
                                             shape = RoundedCornerShape(6.dp)
                                         ) {
+                                            val badgeText = when (ep.chargeEvidenceSource) {
+                                                com.example.domain.ChargeEvidenceSource.COUNTER_MEASURED -> "Counter"
+                                                com.example.domain.ChargeEvidenceSource.MIXED -> "Mixed"
+                                                com.example.domain.ChargeEvidenceSource.ESTIMATED -> "Estimated"
+                                            }
                                             Text(
-                                                text = if (ep.counterMeasured) "Counter" else "Estimated",
+                                                text = badgeText,
                                                 style = MaterialTheme.typography.labelSmall,
                                                 color = accent,
                                                 modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)

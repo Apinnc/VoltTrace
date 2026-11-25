@@ -56,6 +56,7 @@ class MonitorPreferences(private val context: Context) {
         val WATCH_MATCH_COUNT = intPreferencesKey("watch_investigation_match_count")
         val WATCH_LAST_MATCHED_MS = longPreferencesKey("watch_investigation_last_matched_ms")
         val WATCH_LAST_MATCHED_EVENT_ID = stringPreferencesKey("watch_investigation_last_matched_event_id")
+        val WATCH_LAST_NOTIFIED_EVENT_ID = stringPreferencesKey("watch_investigation_last_notified_event_id")
         val WATCH_LAST_MATCH_SUMMARY = stringPreferencesKey("watch_investigation_last_match_summary")
     }
 
@@ -73,6 +74,7 @@ class MonitorPreferences(private val context: Context) {
             matchCount = prefs[Keys.WATCH_MATCH_COUNT] ?: 0,
             lastMatchedAtMs = prefs[Keys.WATCH_LAST_MATCHED_MS] ?: 0L,
             lastMatchedEventId = prefs[Keys.WATCH_LAST_MATCHED_EVENT_ID] ?: "",
+            lastNotifiedEventId = prefs[Keys.WATCH_LAST_NOTIFIED_EVENT_ID] ?: "",
             lastMatchSummary = prefs[Keys.WATCH_LAST_MATCH_SUMMARY] ?: ""
         )
         UserMonitorSettings(
@@ -137,6 +139,7 @@ class MonitorPreferences(private val context: Context) {
             it[Keys.WATCH_MATCH_COUNT] = config.matchCount
             it[Keys.WATCH_LAST_MATCHED_MS] = config.lastMatchedAtMs
             it[Keys.WATCH_LAST_MATCHED_EVENT_ID] = config.lastMatchedEventId
+            it[Keys.WATCH_LAST_NOTIFIED_EVENT_ID] = config.lastNotifiedEventId
             it[Keys.WATCH_LAST_MATCH_SUMMARY] = config.lastMatchSummary
         }
     }
@@ -150,22 +153,46 @@ class MonitorPreferences(private val context: Context) {
             it[Keys.WATCH_MATCH_COUNT] = 0
             it[Keys.WATCH_LAST_MATCHED_MS] = 0L
             it[Keys.WATCH_LAST_MATCHED_EVENT_ID] = ""
+            it[Keys.WATCH_LAST_NOTIFIED_EVENT_ID] = ""
             it[Keys.WATCH_LAST_MATCH_SUMMARY] = ""
         }
     }
 
-    suspend fun recordWatchMatch(matchedEventId: String, matchedAtMs: Long, summary: String) {
+    suspend fun recordWatchMatch(matchedEventId: String, matchedAtMs: Long, summary: String): Boolean {
+        var recorded = false
         context.voltTraceDataStore.edit {
+            val active = it[Keys.WATCH_ACTIVE] ?: false
+            val armedAt = it[Keys.WATCH_ARMED_AT_MS] ?: 0L
             val prevCount = it[Keys.WATCH_MATCH_COUNT] ?: 0
             val prevTs = it[Keys.WATCH_LAST_MATCHED_MS] ?: 0L
             val prevId = it[Keys.WATCH_LAST_MATCHED_EVENT_ID] ?: ""
-            val isNewEvent = matchedEventId.isNotBlank() && matchedEventId != prevId && matchedAtMs > prevTs
+            val isNewEvent = active &&
+                matchedEventId.isNotBlank() &&
+                matchedEventId != prevId &&
+                matchedAtMs > armedAt &&
+                matchedAtMs > prevTs
             if (isNewEvent) {
                 it[Keys.WATCH_MATCH_COUNT] = prevCount + 1
                 it[Keys.WATCH_LAST_MATCHED_MS] = matchedAtMs
                 it[Keys.WATCH_LAST_MATCHED_EVENT_ID] = matchedEventId
                 it[Keys.WATCH_LAST_MATCH_SUMMARY] = summary
+                recorded = true
             }
         }
+        return recorded
+    }
+
+    suspend fun tryRecordWatchNotified(matchedEventId: String, matchedAtMs: Long): Boolean {
+        var marked = false
+        context.voltTraceDataStore.edit {
+            val active = it[Keys.WATCH_ACTIVE] ?: false
+            val armedAt = it[Keys.WATCH_ARMED_AT_MS] ?: 0L
+            val prevNotifiedId = it[Keys.WATCH_LAST_NOTIFIED_EVENT_ID] ?: ""
+            if (active && matchedEventId.isNotBlank() && matchedAtMs > armedAt && matchedEventId != prevNotifiedId) {
+                it[Keys.WATCH_LAST_NOTIFIED_EVENT_ID] = matchedEventId
+                marked = true
+            }
+        }
+        return marked
     }
 }

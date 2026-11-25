@@ -40,14 +40,19 @@ object CsvTelemetryParser {
             val isCharging = get("is_charging").equals("true", ignoreCase = true)
 
             val signedMa = get("current_signed_ma")?.toDoubleOrNull()
+            val signedPowerMw = get("power_signed_mw")?.toDoubleOrNull()
             val absMa = get("current_ma")?.toDoubleOrNull() ?: 0.0
-            val canonicalSignedMa = signedMa ?: if (isCharging) abs(absMa) else -abs(absMa)
+            val canonicalSignedMa = when {
+                signedMa != null -> signedMa
+                signedPowerMw != null && voltageMv > 0 -> (signedPowerMw * 1000.0) / voltageMv.toDouble()
+                else -> if (isCharging) abs(absMa) else -abs(absMa)
+            }
             val currentMicroA = (canonicalSignedMa * 1000.0).roundToLong()
 
             val chargeCounterUah = get("charge_counter_uah")?.toLongOrNull() ?: 0L
             val elapsedRealtimeMs = get("elapsed_realtime_ms")?.toLongOrNull() ?: 0L
             val uptimeMs = get("uptime_ms")?.toLongOrNull() ?: 0L
-            val pluggedType = get("plugged_type").orEmpty().ifBlank { if (isCharging) "AC" else "BATTERY" }
+            val pluggedType = get("plugged_type").orEmpty().ifBlank { "UNKNOWN" }
             val isScreenOn = get("screen_on").equals("true", ignoreCase = true)
             val brightnessPct = get("brightness_pct")?.toIntOrNull() ?: 0
             val refreshHz = get("refresh_hz")?.toFloatOrNull() ?: 60f
@@ -65,6 +70,9 @@ object CsvTelemetryParser {
             val isPowerSave = get("power_save").equals("true", ignoreCase = true)
             val fgApp = get("foreground_app")?.takeIf { it.isNotBlank() }
             val source = get("source").orEmpty().ifBlank { "CSV" }
+            val currentUnitVerified = get("current_unit_verified")?.let {
+                !it.equals("false", ignoreCase = true) && it != "0"
+            } ?: true
 
             result.add(
                 BatterySampleEntity(
@@ -98,7 +106,8 @@ object CsvTelemetryParser {
                     uptimeMs = uptimeMs,
                     foregroundPackage = fgApp,
                     foregroundLabel = fgApp,
-                    source = source
+                    source = source,
+                    currentUnitVerified = currentUnitVerified
                 )
             )
         }

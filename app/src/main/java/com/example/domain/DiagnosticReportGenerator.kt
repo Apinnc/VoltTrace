@@ -39,7 +39,16 @@ object DiagnosticReportGenerator {
 
         sb.appendLine("## 1. Executive Summary")
         sb.appendLine("- **Efficiency Score**: ${report.efficiencyScore}/100")
-        val chargeSourceTag = if (report.chargeCounterMeasured) "Hardware Battery Counter" else "Estimated"
+        val chargeSourceTag = when (report.chargeEvidenceSource) {
+            ChargeEvidenceSource.COUNTER_MEASURED -> "Hardware Battery Counter"
+            ChargeEvidenceSource.MIXED -> String.format(
+                Locale.US,
+                "Mixed: %.1f mAh Hardware Battery Counter + %.1f mAh Estimated",
+                report.counterMeasuredDischargedMah,
+                report.estimatedDischargedMah
+            )
+            ChargeEvidenceSource.ESTIMATED -> "Estimated"
+        }
         sb.appendLine(
             "- **Total Discharged**: ${String.format(Locale.US, "%.1f mAh", report.totalDischargedMah)} " +
                 "($chargeSourceTag) | Overall Discharge Rate: ${String.format(Locale.US, "%.2f%%/hr", report.overallDrainRatePctPerHour)}"
@@ -49,6 +58,23 @@ object DiagnosticReportGenerator {
                 "- **Total Charged**: +${String.format(Locale.US, "%.1f mAh", report.totalChargedMah)} " +
                     "across ${RootCauseAnalyzer.formatDuration(report.chargingDurationMs)}"
             )
+            if (report.plugTransitionDurationMs > 0L &&
+                (report.plugTransitionDischargedMah > 0.05f || report.plugTransitionChargedMah > 0.05f)
+            ) {
+                val transitionParts = buildList {
+                    if (report.plugTransitionDischargedMah > 0.05f) {
+                        add(String.format(Locale.US, "-%.1f mAh observed decrease", report.plugTransitionDischargedMah))
+                    }
+                    if (report.plugTransitionChargedMah > 0.05f) {
+                        add(String.format(Locale.US, "+%.1f mAh observed increase", report.plugTransitionChargedMah))
+                    }
+                }
+                sb.appendLine(
+                    "- **Plug/Unplug Transition Change**: ${transitionParts.joinToString(", ")} " +
+                        "across ${RootCauseAnalyzer.formatDuration(report.plugTransitionDurationMs)} " +
+                        "(precise plug-in/unplug time and distribution of use inside the transition are unknown)"
+                )
+            }
             val netDelta = report.netChargeDeltaMah
             val netFormatted = if (netDelta >= 0f) {
                 String.format(Locale.US, "+%.1f mAh (net gained)", netDelta)
@@ -68,6 +94,9 @@ object DiagnosticReportGenerator {
             add("Pure Standby ${RootCauseAnalyzer.formatDuration(report.screenOffDurationMs)}")
             if (report.mixedTransitionDurationMs > 0L) {
                 add("Mixed Screen Transitions ${RootCauseAnalyzer.formatDuration(report.mixedTransitionDurationMs)}")
+            }
+            if (report.plugTransitionDurationMs > 0L) {
+                add("Plug/Unplug Transitions ${RootCauseAnalyzer.formatDuration(report.plugTransitionDurationMs)}")
             }
             if (report.chargingDurationMs > 0L) {
                 add(
@@ -124,9 +153,14 @@ object DiagnosticReportGenerator {
                 "- **Data Quality / Clock Provenance**: ${report.missingClockSampleCount} legacy/pre-upgrade records had `0` in `elapsed_realtime_ms`/`uptime_ms` and were excluded from kernel deep-sleep deltas."
             )
         }
+        if (report.uncertainLegacyUnitSampleCount > 0) {
+            sb.appendLine(
+                "- **Data Quality / Legacy Current Units**: ${report.uncertainLegacyUnitSampleCount} pre-v8 database records had ambiguous current scaling and were retained in raw history while excluded from peak wattage and alert conclusions."
+            )
+        }
         if (latestSample != null) {
             val signedPower = String.format(Locale.US, "%+.2f W", latestSample.powerSignedWatts)
-            val state = if (latestSample.isCharging) "Charging (${latestSample.pluggedType})" else "Discharging"
+            val state = if (latestSample.isCharging) "Charging (${latestSample.pluggedType})" else "Discharging (${latestSample.pluggedType})"
             sb.appendLine("- **Cell Profile**: ${latestSample.technology} | Health: ${BatteryHardwareReader.healthLabel(latestSample.healthCode)} | Current SOC: ${latestSample.levelPct}% ($state · $signedPower)")
         }
         sb.appendLine()
@@ -151,7 +185,16 @@ object DiagnosticReportGenerator {
             report.drainEpisodes.forEachIndexed { idx, ep ->
                 val startIso = RootCauseAnalyzer.formatIsoUtc(ep.startMs)
                 val endIso = RootCauseAnalyzer.formatIsoUtc(ep.endMs)
-                val chargeLabel = if (ep.counterMeasured) "counter-measured" else "estimated"
+                val chargeLabel = when (ep.chargeEvidenceSource) {
+                    ChargeEvidenceSource.COUNTER_MEASURED -> "counter-measured"
+                    ChargeEvidenceSource.MIXED -> String.format(
+                        Locale.US,
+                        "mixed: %.1f mAh counter-measured + %.1f mAh estimated",
+                        ep.counterMeasuredMah,
+                        ep.estimatedMah
+                    )
+                    ChargeEvidenceSource.ESTIMATED -> "estimated"
+                }
                 sb.appendLine(
                     "### Episode ${idx + 1} [${ep.severity.name}]: $startIso → $endIso (${RootCauseAnalyzer.formatDuration(ep.durationMs)})"
                 )
@@ -228,8 +271,9 @@ object DiagnosticReportGenerator {
             sb.appendLine("|---|---:|---:|---:|---:|---:|---:|")
             report.appCulprits.forEach { app ->
                 if (app.hasEnergyEstimate) {
+                    val estSuffix = if (app.isUniformTimeEstimate) " (uniform time est.)" else ""
                     sb.appendLine(
-                        "| ${app.appLabel} | ${String.format(Locale.US, "%.1f%%", app.shareOfTotalDrainPct)} | " +
+                        "| ${app.appLabel}$estSuffix | ${String.format(Locale.US, "%.1f%%", app.shareOfTotalDrainPct)} | " +
                             "${String.format(Locale.US, "%.1f%%", app.sharePct)} | " +
                             "${String.format(Locale.US, "%.1f", app.estimatedMah)} | " +
                             "${RootCauseAnalyzer.formatDuration(app.totalForegroundMs)} | " +
@@ -242,6 +286,9 @@ object DiagnosticReportGenerator {
                             "${app.wakeupCount} | Usage only |"
                     )
                 }
+            }
+            if (report.appCulprits.any { it.isUniformTimeEstimate }) {
+                sb.appendLine("_Note: Entries marked `(uniform time est.)` are a uniform time estimate scaled by the app's fraction of the total window duration (no per-interval drain events were stored for this window)._")
             }
         }
 
